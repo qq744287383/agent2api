@@ -58,3 +58,8 @@ desktop-tauri/mobile/android/keystore.properties
 
 # 本地测试跑出来的运行数据（数据库、加密密钥、日志）
 .agenttest2/
+
+# 本地 npm 缓存（沙箱里全局缓存只读，安装时指到仓库内）
+.npm-cache/
+# 原型运行现场（一次性，见 prototype/pinned-upstream-modal 分支）
+.prototype-pin/
