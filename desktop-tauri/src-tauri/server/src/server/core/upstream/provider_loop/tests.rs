@@ -528,6 +528,18 @@ fn a_deterministic_404_skips_the_in_place_resend() {
 //   · 日志里写的原因还是错的（说「状态码命中」，实际是超时）。
 // 这两条用例就是这层判据的唯一防线。
 
+/// 动全局配置的用例串行跑。
+///
+/// `config::set_pinned_upstream` 改的是**进程级**快照，而这些用例要读它
+/// （`pin_switch_due` 内部现读配置）。并行跑时一条用例刚写完、另一条就把它
+/// 覆盖掉，症状是「单跑绿、全量跑红」—— 与 `config` 模块自己的 `CONFIG_LOCK`
+/// 同一手法、同一理由（那边也是私有锁，两个模块各自持有即可，因为互不重叠）。
+static PIN_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn hold_pin_config() -> std::sync::MutexGuard<'static, ()> {
+    PIN_CONFIG_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// 构造一个「传输层失败」形态的 `OutboundFailure`。
 fn transport_failure(reason: &str, timed_out: bool) -> OutboundFailure {
     let message = format!("{reason}（直连）");
@@ -588,6 +600,7 @@ fn no_pin_means_no_switch_no_matter_what_failed() {
 /// 超时命中就切，**不需要**用户填的状态码配合。
 #[test]
 fn a_wait_timeout_switches_even_when_the_status_list_is_empty() {
+    let _guard = hold_pin_config();
     let pin = upstream_ip_pin::PinTarget::new("1.2.3.4").expect("测试地址应当合法");
     // 状态码名单为空（用户显式保存过空数组）：只按超时判
     let _ = config::set_pinned_upstream(config::PinnedUpstreamPatch {
@@ -606,6 +619,7 @@ fn a_wait_timeout_switches_even_when_the_status_list_is_empty() {
 /// 状态码命中就切；没命中就不切（这条是「不要见错就切」的对照组）。
 #[test]
 fn a_listed_status_code_switches_and_an_unlisted_one_does_not() {
+    let _guard = hold_pin_config();
     let pin = upstream_ip_pin::PinTarget::new("1.2.3.4").expect("测试地址应当合法");
     let _ = config::set_pinned_upstream(config::PinnedUpstreamPatch {
         enabled: Some(true),
@@ -630,6 +644,7 @@ fn a_listed_status_code_switches_and_an_unlisted_one_does_not() {
 /// （那是默认值），所以这条判据错了，等于**每次连不上都白切一个 IP**。
 #[test]
 fn a_gateway_synthesised_502_is_not_mistaken_for_an_upstream_502() {
+    let _guard = hold_pin_config();
     let pin = upstream_ip_pin::PinTarget::new("1.2.3.4").expect("测试地址应当合法");
     let _ = config::set_pinned_upstream(config::PinnedUpstreamPatch {
         enabled: Some(true),
