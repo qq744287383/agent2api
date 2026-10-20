@@ -323,6 +323,10 @@ export function closeDialog(): void {
   patch({ dialog: null })
 }
 
+export function openPinnedUpstreamDialog(provider: string): void {
+  patch({ dialog: { kind: 'pinned-upstream', provider } })
+}
+
 export function openBatchDialog(ids: string[], action = 'enable'): void {
   const selected = (Array.isArray(ids) ? ids : []).filter(id => findAccount(id))
   if (!selected.length) { toast(t('请先勾选要操作的账号'), 'err'); return }

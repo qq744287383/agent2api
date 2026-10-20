@@ -65,6 +65,11 @@ export const ACCOUNT_COLUMNS: AccountColumn[] = [
     align: 'center',
   },
   {
+    key: 'upstreamIp', label: t('上游 IP'),
+    title: t('该账号固定使用的上游 IP；默认跟随组（组当前 IP 见分组带）'),
+    align: 'center',
+  },
+  {
     key: 'connections', label: t('连接数'),
     title: t('此刻正在使用这个账号的请求数（含还在下发内容的流式请求）；为 0 时不显示'),
     align: 'center',
@@ -107,6 +112,7 @@ const DEFAULTS: Record<string, number> = {
   pick: 47,
   order: 84,
   proxy: 186,
+  upstreamIp: 148,
   connections: 56,
   status: 80,
   limits: 148,

@@ -49,6 +49,10 @@
    132 的内容盒只有 104px —— 组名会被砍成「Claude/GP…」，而那正是这个功能要让人
    看见的一组（issue #288）。固定列合计 1013 → 1029，横滚线 1313 → 1329。
 
+   **新增上游 IP 列 148px**（固定上游 IP 功能）：只有 WorkBuddy 国际版有内容，
+   其余家留空。固定列合计 1029 → 1177，横滚线 1329 → 1477。
+   不需要这一列的用户可以在列设置里关掉（table-col-settings.tsx）。
+
    **勾选列 26 → 47**（本轮）：26px 的列里居中的复选框只离表格左缘 5.5px，
    看起来是「贴边」而不是居中，还与批量栏那颗「全选」错开 10.5px。
    47 = 16 + 15 + 16 让它与批量栏全选落在同一条竖轴上，算式与理由见下方 .cell-pick。
@@ -192,6 +196,12 @@
    表头文案与相邻读数列（有效期 / 余额）在同一条中轴上，扫读不忽左忽右） */
 .acct-table th.cell-proxy,
 .acct-table td.cell-proxy { text-align: center; }
+/* 上游 IP 列（只有 WorkBuddy 国际版有内容）：容得下「跟随组（1.2.3.4）」这类
+   触发器文案的省略形态。宽度与 accounts-columns.ts 的 DEFAULTS.upstreamIp 同步，
+   两处必须一起改（没有拖过的列走这里，拖过或还原后以那份为准）。 */
+.cell-upstreamIp { width: 148px; }
+.acct-table th.cell-upstreamIp,
+.acct-table td.cell-upstreamIp { text-align: center; }
 .cell-connections { width: 56px; }
 /* 表头与单元格一起居中：数字居中而标题左对齐时，视线要从标题左端跳到格子中央 */
 .acct-table th.cell-connections,
@@ -513,6 +523,28 @@ body.queue-dragging * { cursor: grabbing !important; }
 .grp-balance.warn .v { color: var(--warn); }
 .grp-balance.muted .v { color: var(--text-3); font-weight: 600; }
 .grp-balance .warn-mark { color: var(--warn); font-size: 10px; }
+
+/* 组头「固定上游 IP」当前值（只有 WorkBuddy 国际版、且开关打开时渲染）。
+   等宽字体读 IP，右侧一个小按钮手动切下一个。
+   颜色用中性两档，不抢组名的份量 —— 它是一个读数，不是标题。 */
+.grp-pin {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 2px 0 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm, 4px);
+  background: var(--surface);
+  white-space: nowrap;
+}
+.grp-pin-ip {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+.grp-pin-rotate { width: 18px; height: 18px; }
+.grp-pin-rotate:disabled { opacity: 0.5; cursor: default; }
 
 .grp-spacer { flex: 1 1 auto; }
 

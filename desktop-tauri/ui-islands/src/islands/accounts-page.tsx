@@ -80,7 +80,7 @@ import {
 } from './accounts-data'
 import {
   AccountCell, ActionsCell, ConnectionsCell, ExpiryCell, GroupBandRow, LimitsCell, OrderCell,
-  PanelsRow, ProxyCell, StatusCell, TableHead, UsageCell,
+  PanelsRow, ProxyCell, StatusCell, TableHead, UpstreamIpCell, UsageCell,
 } from './accounts-panels'
 import { bindQueueDrag, type QueueDrop } from './accounts-queue-drag'
 import { AccountsDialogs } from './accounts-dialogs'
@@ -368,6 +368,8 @@ function AccountsPage() {
         return <AccountCell account={account} namesHidden={store.namesHidden} />
       case 'proxy':
         return <ProxyCell account={account} />
+      case 'upstreamIp':
+        return <UpstreamIpCell account={account} />
       case 'connections':
         return <ConnectionsCell account={account} />
       case 'status':
@@ -652,6 +654,7 @@ function ColGroup() {
       {col('order')}
       {col('account')}
       {col('proxy')}
+      {col('upstreamIp')}
       {col('connections')}
       {col('status')}
       {col('limits')}

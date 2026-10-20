@@ -30,10 +30,12 @@ import {
   visibleAccounts, type AccountFilter, type AccountGroup, type TokenUsageLookup, type UsageLookup,
 } from './accounts-domain'
 
-/** 弹窗状态：账号设置（单个）/ 批量操作（多选 + 动作），关闭即 null */
+/** 弹窗状态：账号设置（单个）/ 批量操作（多选 + 动作）/ 固定上游 IP（组级），关闭即 null */
 export type AccountsDialog =
   | { kind: 'settings'; id: string }
   | { kind: 'batch'; ids: string[]; action: string }
+  /** 固定上游 IP：provider 级的开关 / IP 列表 / 超时 / 状态码（只有 workbuddy-intl 有入口） */
+  | { kind: 'pinned-upstream'; provider: string }
   | null
 
 export type AccountsStore = {

@@ -260,7 +260,28 @@ type ConfirmOptions = {
   bodyClass?: string
 }
 
+/** `/api/pinned-upstream-ip` 的响应内层（桥接已剥掉 {success,data} 信封）。 */
+export type PinnedUpstreamPayload = {
+  pinnedUpstreamIp: {
+    enabled: boolean
+    ips: string[]
+    waitTimeoutSeconds: number
+    statusCodes: number[]
+    currentIp: string
+  }
+  globalWaitTimeoutSeconds: number
+  effectiveWaitTimeoutSeconds: number
+}
+
 export type AccountsBridge = {
+  /**
+   * 固定上游 IP（provider 级）。PUT 允许部分字段、返回生效后的全量值。
+   *
+   * **有副作用**：IP 列表一变，后端会把该组所有账号的独立 IP 重置为「跟随组」，
+   * 并从新列表重新选一个组当前 IP（见 api/pinned_upstream.rs 的模块头）。
+   */
+  getPinnedUpstream?(): Promise<PinnedUpstreamPayload | null | undefined>
+  savePinnedUpstream?(patch: Record<string, unknown>): Promise<PinnedUpstreamPayload | null | undefined>
   getAccountConnections(): Promise<{ counts?: Record<string, unknown> } | null | undefined>
   updateAccount(id: string, patch: Record<string, unknown>): Promise<{ changes?: string[] } | null | undefined>
   /** 整队重排（分组模式）：把新队列整条交上去（从队首到队尾的 id 数组） */

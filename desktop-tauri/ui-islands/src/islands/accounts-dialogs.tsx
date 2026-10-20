@@ -62,6 +62,7 @@ import { limiterDraftOf, LimiterSection, readLimiterChanges } from './accounts-d
 import {
   allAccounts, clashOptions, closeDialog, findAccount, getStore, proxyPoolOptions,
 } from './accounts-data'
+import { PinnedUpstreamDialog } from './accounts-dialog-pinned-upstream'
 
 /** 名称长度上限，与后端 custom_providers::MAX_NAME_CHARS 一致（前端先挡一次） */
 const MAX_PROVIDER_NAME_CHARS = 64
@@ -1436,6 +1437,15 @@ export function AccountsDialogs() {
   if (!store.dialog) return null
   if (store.dialog.kind === 'settings') {
     return <AccountSettingsDialog key={store.dialog.id} id={store.dialog.id} onClose={closeDialog} />
+  }
+  if (store.dialog.kind === 'pinned-upstream') {
+    return (
+      <PinnedUpstreamDialog
+        key={store.dialog.provider}
+        provider={store.dialog.provider}
+        onClose={closeDialog}
+      />
+    )
   }
   return <BatchDialog key={store.dialog.ids.join(',')} ids={store.dialog.ids} action={store.dialog.action}
     onClose={closeDialog} />

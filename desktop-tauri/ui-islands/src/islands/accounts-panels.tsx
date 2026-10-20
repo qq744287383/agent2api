@@ -40,7 +40,7 @@ import {
   TooltipTrigger,
   cn,
 } from '@ui'
-import { formatTime, numberText, poolItemLabel, POOL_VALUE_PREFIX, shared, type AccountRecord, type LimiterRule, type TokenReading, type UsageEntry } from './accounts-shared'
+import { errorMessage, formatTime, numberText, poolItemLabel, POOL_VALUE_PREFIX, shared, toast, type AccountRecord, type LimiterRule, type TokenReading, type UsageEntry } from './accounts-shared'
 import {
   accountTags, activeLimits, balanceBlockedOf, claimDoneTitle, claimedToday,
   displayNameOf, expiryMillis, formatIntervalSeconds, formatResetText,
@@ -53,7 +53,7 @@ import {
 import { CreditDetailButton, creditRowsOf } from './accounts-credit-detail'
 import {
   PROXY_CUSTOM_CURRENT, PROXY_CUSTOM_EDIT, applyProxyPick,
-  connectionsOf, maskName, openBatchDialog, openSettingsDialog, openZcodePlans,
+  connectionsOf, maskName, openBatchDialog, openPinnedUpstreamDialog, openSettingsDialog, openZcodePlans,
   poolError, proxyPoolSnapshot, queryUsageOnce, setAccountEnabled, setGroupEnabled, setPanelOpen,
   tokenUsageOf, toggleGroupCollapsed, toggleNamesHidden, usageEntryOf, usageFailureOf,
 } from './accounts-data'
@@ -131,6 +131,14 @@ function GroupMenu({ group, ids, collapsed }: { group: AccountGroup; ids: string
             onClick={() => { setOpen(false); openBatchDialog(ids, 'proxy') }}>
             {t('批量操作本组')}
           </Button>
+          {/* 固定上游 IP：只有 WorkBuddy 国际版有（provider id 才是判据，见 GLOSSARY） */}
+          {group.provider === 'workbuddy-intl' && (
+            <Button variant='ghost' size='sm' className={itemClass}
+              title={t('为一组 IPv4 地址设定上游，超过等待时间或命中异常状态码时自动切换')}
+              onClick={() => { setOpen(false); openPinnedUpstreamDialog(group.provider) }}>
+              {t('固定上游 IP')}
+            </Button>
+          )}
           <div className='my-1 h-px bg-hairline' />
           <Button variant='ghost' size='sm' className={itemClass}
             onClick={() => { setOpen(false); toggleGroupCollapsed(group.provider) }}>
@@ -139,6 +147,74 @@ function GroupMenu({ group, ids, collapsed }: { group: AccountGroup; ids: string
         </div>
       </PopoverContent>
     </Popover>
+  )
+}
+
+/* ─── 组头「固定上游 IP」当前值（只有 WorkBuddy 国际版）──────── */
+
+/**
+ * 组标题后面的当前上游 IP + 手动切换按钮。
+ *
+ * 只在开关打开时出现：关掉时这一格完全不存在（用户故事 34：关掉就该看不到任何
+ * 与它相关的元素），所以不渲染一个「已关闭」的灰条占位。
+ *
+ * 为什么要显示在组头上而不是只放在弹窗里：当前 IP 是这一组所有「跟随组」账号
+ * 实际在用的线路，排查「请求打到哪条线」时第一眼看的就是这里。
+ *
+ * 数据来自 `/api/pinned-upstream-ip`（懒读一次，组头渲染不阻塞在它上面 ——
+ * 读不到就什么都不显示，不报错也不占位）。
+ */
+function GroupPinnedIpBadge() {
+  const [state, setState] = React.useState<{ enabled: boolean; currentIp: string } | null>(null)
+  const [busy, setBusy] = React.useState(false)
+
+  const load = React.useCallback(async () => {
+    const response = await shared().workbuddyDesktop?.getPinnedUpstream?.()
+    const settings = response?.pinnedUpstreamIp
+    setState(settings ? { enabled: settings.enabled, currentIp: settings.currentIp } : null)
+  }, [])
+
+  React.useEffect(() => { void load() }, [load])
+
+  if (!state?.enabled || !state.currentIp) return null
+
+  /** 手动前进一个 IP：写回 currentIp 后重读（后端会校验它确实在列表里）。 */
+  async function rotate(): Promise<void> {
+    if (busy) return
+    setBusy(true)
+    try {
+      const response = await shared().workbuddyDesktop?.getPinnedUpstream?.()
+      const settings = response?.pinnedUpstreamIp
+      const ips = settings?.ips ?? []
+      if (ips.length < 2) {
+        toast(t('只有一条 IP，无法切换'), 'err')
+        return
+      }
+      const index = ips.indexOf(state!.currentIp)
+      const next = ips[(index + 1) % ips.length]
+      await shared().workbuddyDesktop?.savePinnedUpstream?.({ currentIp: next })
+      await load()
+      toast(t('已切换到上游 IP {ip}', { ip: next }))
+    } catch (error) {
+      toast(errorMessage(error), 'err')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <span className='grp-pin' title={t('固定上游 IP：组内「跟随组」的账号都用这个地址访问上游')}>
+      <span className='grp-pin-ip'>{state.currentIp}</span>
+      <button
+        type='button'
+        className='grp-iconbtn grp-pin-rotate'
+        disabled={busy}
+        title={t('手动切换到下一个上游 IP（只影响之后的请求）')}
+        aria-label={t('切换上游 IP')}
+        onClick={() => void rotate()}
+        dangerouslySetInnerHTML={{ __html: iconHtml('refresh', 13) }}
+      />
+    </span>
   )
 }
 
@@ -323,6 +399,7 @@ export function GroupBandRow({ group, collapsed, colSpan }: {
               : <span className='grp-logo-txt'>{String(group.label || '?').trim().slice(0, 1).toUpperCase()}</span>}
           </span>
           <span className='grp-name'>{t(group.label)}</span>
+          {group.provider === 'workbuddy-intl' && <GroupPinnedIpBadge />}
           <span className='grp-stat'>{t('{total} 个账号 · 启用 {enabled} · 禁用 {disabled}{limited}', {
             total: group.members.length,
             enabled: group.enabled,
@@ -1240,6 +1317,80 @@ function prominentTokenLimit(account: AccountRecord): React.ReactNode {
   )
 }
 
+/* ─── 「上游 IP」列（只有 WorkBuddy 国际版有内容）─────────────── */
+
+/**
+ * 账号级固定上游 IP 的下拉。
+ *
+ * 首项是「跟随组（当前 x.x.x.x）」，其余是组 IP 列表 —— 默认值就是跟随组
+ * （用户故事 19：新增账号不该需要额外配置）。
+ *
+ * ── 三个只在特定条件下渲染的情形 ────────────────────────────
+ *   · 不是 `workbuddy-intl` → 整格留空（别的家没有这个概念）；
+ *   · 固定上游 IP 开关关着 → 整格留空（用户故事 34：关掉就看不到相关元素）；
+ *   · 组里还没有任何 IP → 留空（没有可选项，画一个空下拉只会让人点进去发现没东西）。
+ *
+ * 写回走 `updateAccount` 的 `pinnedUpstreamIp` 字段（后端 `apply_patch` 侧校验
+ * IPv4，非法值会被 400 拒绝；这里选的都是列表里的值，正常不会撞上）。
+ */
+export function UpstreamIpCell({ account }: { account: AccountRecord }) {
+  const [state, setState] = React.useState<{ enabled: boolean; ips: string[]; currentIp: string } | null>(null)
+  const [busy, setBusy] = React.useState(false)
+
+  const load = React.useCallback(async () => {
+    if (providerOf(account) !== 'workbuddy-intl') return
+    const response = await shared().workbuddyDesktop?.getPinnedUpstream?.()
+    const settings = response?.pinnedUpstreamIp
+    if (!settings) return
+    setState({ enabled: settings.enabled, ips: settings.ips, currentIp: settings.currentIp })
+  }, [account])
+
+  React.useEffect(() => { void load() }, [load])
+
+  if (providerOf(account) !== 'workbuddy-intl') return null
+  if (!state?.enabled || state.ips.length === 0) return null
+
+  const pinned = String(account.pinnedUpstreamIp || '').trim()
+  const current = pinned || '__follow__'
+  const followLabel = state.currentIp
+    ? t('跟随组（{ip}）', { ip: state.currentIp })
+    : t('跟随组')
+
+  async function pick(value: string): Promise<void> {
+    if (busy) return
+    setBusy(true)
+    try {
+      await shared().workbuddyDesktop?.updateAccount?.(String(account.id), {
+        pinnedUpstreamIp: value === '__follow__' ? null : value,
+      })
+      await shared().wbApp?.refresh?.()
+      await load()
+    } catch (error) {
+      toast(errorMessage(error), 'err')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Select value={current} onValueChange={value => void pick(String(value))}>
+      <SelectTrigger
+        className={cn('w-full', busy && 'opacity-60')}
+        title={t('该账号固定使用的上游 IP；默认跟随组')}
+        aria-label={t('上游 IP')}
+      >
+        <SelectValue>{pinned || followLabel}</SelectValue>
+      </SelectTrigger>
+      <SelectContent>
+        <SelectItem value='__follow__'>{followLabel}</SelectItem>
+        {state.ips.map(ip => (
+          <SelectItem key={ip} value={ip}>{ip}</SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  )
+}
+
 export function UsageCell({ account }: { account: AccountRecord }) {
   if (!supportsUsage(account)) {
     return <span className='muted' title={t('该提供商没有余额查询')}>—</span>
@@ -1879,6 +2030,10 @@ export function TableHead({ namesHidden, allPicked, somePicked, disabled, onTogg
         </th>
         <th className='cell-proxy' data-col='proxy'>
           <span className='th-label' title={t('该账号出网走的代理（Clash 出口 / 自定义 / 直连）；点击可修改')}>{t('代理')}</span>
+          {grip}
+        </th>
+        <th className='cell-upstreamIp' data-col='upstreamIp'>
+          <span className='th-label' title={t('该账号固定使用的上游 IP；默认跟随组（组当前 IP 见分组带）')}>{t('上游 IP')}</span>
           {grip}
         </th>
         <th className='cell-connections' data-col='connections'>
