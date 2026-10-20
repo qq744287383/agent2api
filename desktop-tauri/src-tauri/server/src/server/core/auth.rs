@@ -35,7 +35,8 @@ use crate::server::logging;
 // `send_request` 保留导出：登录流程（login.rs）与切片 4 的转发都会用它走直连档。
 #[allow(unused_imports)]
 pub use crate::server::core::auth_http::{
-    send_public_request, send_request, send_request_via, unwrap_public_response,
+    send_public_request, send_request, send_request_via, send_request_via_pinned,
+    unwrap_public_response,
     unwrap_response, WorkBuddyAuthError, REFRESH_WINDOW_MS, SERVER_CODE_RETRY_FETCH_TOKEN,
 };
 
@@ -494,6 +495,7 @@ impl AuthService {
         auth: &Value,
         context: &Context,
         proxy: Option<&ResolvedProxy>,
+        pin: Option<&crate::server::core::upstream::upstream_ip_pin::PinTarget>,
     ) -> Result<RefreshedAuth, WorkBuddyAuthError> {
         let refresh_token = auth
             .get("refreshToken")
@@ -508,8 +510,18 @@ impl AuthService {
         headers.push(("X-Refresh-Token".to_string(), refresh_token.to_string()));
         headers.push(("X-Auth-Refresh-Source".to_string(), "plugin".to_string()));
         let url = context.auth_url("/auth/token/refresh");
-        let response =
-            send_request_via("POST", &url, Some(&json!({})), &headers, proxy, None).await?;
+        // 续期请求与对话打同一个域名：固定上游 IP 必须一视同仁，
+        // 否则续期仍走系统 DNS（这一半流量就绕过了用户选的线路）
+        let response = send_request_via_pinned(
+            "POST",
+            &url,
+            Some(&json!({})),
+            &headers,
+            proxy,
+            pin,
+            None,
+        )
+        .await?;
         let data = unwrap_response(&response, "auth/token/refresh")?;
         let access_token = data
             .get("accessToken")
@@ -607,7 +619,12 @@ impl AuthService {
         let auth = session.get("auth").cloned().unwrap_or(Value::Null);
         // 续期也走该账号自己的出口（账号没配代理 → 直连）
         let proxy = session_proxy(&session);
-        let next = match self.refresh_session(&auth, &context, proxy.as_ref()).await {
+        // 固定上游 IP 同样按该账号的设定（账号独立 IP 优先，否则组当前 IP）
+        let pin = crate::server::core::upstream::upstream_ip_pin::pin_for_session(
+            &session,
+            proxy.is_some(),
+        );
+        let next = match self.refresh_session(&auth, &context, proxy.as_ref(), pin.as_ref()).await {
             Ok(next) => next,
             Err(error) => {
                 // ── RT 已被上游作废（12153）：连续多次才判定会话死亡 ──────

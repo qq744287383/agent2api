@@ -65,7 +65,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use serde_json::{json, Value};
 
-use crate::server::core::auth_http::send_raw;
+use crate::server::core::auth_http::send_raw_pinned;
 use crate::server::core::endpoints::{normalize_endpoint, user_agent_for_edition};
 use crate::server::core::providers::workbuddy::region::Region;
 use crate::server::core::providers::catalog_cache;
@@ -436,7 +436,7 @@ impl ModelCatalog {
             let mut headers: Vec<(String, String)> =
                 vec![("User-Agent".to_string(), params.user_agent.to_string())];
             headers.extend(params.headers.iter().cloned());
-            match send_raw("GET", &url, None, &headers, params.proxy, None).await {
+            match send_raw_pinned("GET", &url, None, &headers, params.proxy, params.pin, None).await {
                 // 不校验 HTTP 状态：与 Node 一致 —— 先按 JSON 解析，再看有没有可用模型
                 Ok(response) => match response.payload {
                     Some(payload) => {
@@ -494,7 +494,7 @@ impl ModelCatalog {
                     encode_uri_component(enterprise_id)
                 );
                 let headers: Vec<(String, String)> = params.headers.to_vec();
-                return match send_raw("GET", &url, None, &headers, params.proxy, None).await {
+                return match send_raw_pinned("GET", &url, None, &headers, params.proxy, params.pin, None).await {
                     Ok(response) => {
                         let raw = response
                             .payload
@@ -709,6 +709,11 @@ impl ModelCatalog {
         // `WorkBuddy/5.5.4`；服务端按 UA 识别通道，给错会拿到另一套清单）
         let user_agent = user_agent_for_edition(Some(self.region.id()));
 
+        // 固定上游 IP：目录拉取与对话打同一个域名，必须同一口径
+        let pin = crate::server::core::upstream::upstream_ip_pin::pin_for_session(
+            &session,
+            proxy.is_some(),
+        );
         let outcome = self
             .refresh(RefreshParams {
                 endpoint: &endpoint,
@@ -716,6 +721,7 @@ impl ModelCatalog {
                 headers: &headers,
                 user_agent: &user_agent,
                 proxy: proxy.as_ref(),
+                pin: pin.as_ref(),
             })
             .await;
         if outcome.refreshed {
@@ -737,6 +743,9 @@ pub struct RefreshParams<'a> {
     pub headers: &'a [(String, String)],
     pub user_agent: &'a str,
     pub proxy: Option<&'a ResolvedProxy>,
+    /// 固定上游 IP（`None` = 走系统 DNS）。目录请求打的是同一个上游域名，
+    /// 不带上它这一半流量就绕过了用户选的线路（见 GLOSSARY 的「固定上游 IP」）。
+    pub pin: Option<&'a crate::server::core::upstream::upstream_ip_pin::PinTarget>,
 }
 
 /// 刷新结果：成功 `{refreshed:true, count, source}`，

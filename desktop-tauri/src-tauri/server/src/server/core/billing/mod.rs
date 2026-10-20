@@ -42,7 +42,7 @@ use serde_json::{json, Map, Value};
 
 use crate::server::config;
 use crate::server::core::auth::AuthService;
-use crate::server::core::auth_http::{send_raw, ApiResponse};
+use crate::server::core::auth_http::{send_raw_pinned, ApiResponse};
 use crate::server::core::endpoints::{normalize_endpoint, resolve_edition, RESPONSE_CODE_OK};
 use crate::server::core::proxies::ResolvedProxy;
 use crate::server::logging;
@@ -254,12 +254,19 @@ impl BillingService {
             ),
         );
 
-        let response: ApiResponse = send_raw(
+        // 固定上游 IP：计费请求打同一个上游域名，与对话同一口径。
+        // `session` 是账号公开形态（含 `pinnedUpstreamIp`），代理存在时不生效。
+        let pin = crate::server::core::upstream::upstream_ip_pin::pin_for_session(
+            &session,
+            proxy.is_some(),
+        );
+        let response: ApiResponse = send_raw_pinned(
             spec.method,
             &url,
             body.as_ref(),
             &headers,
             proxy.as_ref(),
+            pin.as_ref(),
             Some(REQUEST_TIMEOUT_MS),
         )
         .await

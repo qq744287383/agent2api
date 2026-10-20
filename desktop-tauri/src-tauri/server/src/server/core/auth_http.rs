@@ -123,6 +123,21 @@ pub async fn send_request_via(
         .map_err(|error| WorkBuddyAuthError::new(describe_transport_error(&error)))
 }
 
+/// [`send_request_via`] 的带固定上游 IP 版本（凭证续期用）。
+pub async fn send_request_via_pinned(
+    method: &str,
+    url: &str,
+    body: Option<&Value>,
+    headers: &[(String, String)],
+    proxy: Option<&ResolvedProxy>,
+    pin: Option<&crate::server::core::upstream::upstream_ip_pin::PinTarget>,
+    timeout_ms: Option<u64>,
+) -> Result<ApiResponse, WorkBuddyAuthError> {
+    send_raw_pinned(method, url, body, headers, proxy, pin, timeout_ms)
+        .await
+        .map_err(|error| WorkBuddyAuthError::new(describe_transport_error(&error)))
+}
+
 /// 与 `send_request_via` 同一实现，但把**原始传输错误**交给调用方。
 ///
 /// 只有计费模块用它：Node 版的 `callBilling` 需要区分「超时」（→ 504
@@ -137,7 +152,30 @@ pub async fn send_raw(
     proxy: Option<&ResolvedProxy>,
     timeout_ms: Option<u64>,
 ) -> Result<ApiResponse, reqwest::Error> {
-    let client = egress::client_for(proxy);
+    send_raw_pinned(method, url, body, headers, proxy, None, timeout_ms).await
+}
+
+/// [`send_raw`] 的带固定上游 IP 版本。
+///
+/// ── 为什么另起一个函数而不是给 `send_raw` 加参数 ──────────────
+/// `send_raw` 有二十多个调用方（各家的目录 / 余额 / 续期 / 探测 / OAuth），
+/// 其中只有 WorkBuddy 国际版的几条要固定 IP。加参数等于让二十多处都写一个
+/// `None`，制造一次与本次改动无关的批量 diff —— 而那种 diff 会在 review 时
+/// 掩盖真正的改动（历史上有过这种教训）。旧入口降级成「不带固定 IP」的
+/// 薄包装，存量调用点一行不用改。
+///
+/// `pin` 与 `proxy` 同时存在时**以代理为准**（DNS 由代理做）—— 但这条判据的
+/// 主场在 `upstream_ip_pin::resolve_pin`，正常路径不会带 pin 走代理。
+pub async fn send_raw_pinned(
+    method: &str,
+    url: &str,
+    body: Option<&Value>,
+    headers: &[(String, String)],
+    proxy: Option<&ResolvedProxy>,
+    pin: Option<&crate::server::core::upstream::upstream_ip_pin::PinTarget>,
+    timeout_ms: Option<u64>,
+) -> Result<ApiResponse, reqwest::Error> {
+    let client = egress::client_for_pinned(proxy, pin);
     let mut builder = match method {
         "POST" => client.post(url),
         _ => client.get(url),
