@@ -125,6 +125,12 @@ pub struct RuntimeConfig {
     /// 与 timeouts 同一理由：转发层**每次选路**都要取它（改完设置下一个
     /// 请求就生效，不重启进程），解析一次存下来最省事。
     routing: RoutingSettings,
+    /// 固定上游 IP（账号页 WorkBuddy 国际版组菜单的弹窗）。
+    ///
+    /// 与 routing 同一理由：转发层**每轮失败判定**都要取它（超时还是状态码、
+    /// 当前 IP 是谁、要不要切），解析一次存下来最省事。两个列表都是 `Arc`，
+    /// 取值只付一次指针自增。
+    pinned_upstream: PinnedUpstreamSettings,
     /// 事件日志的保存目录（原始配置值；None = 未设置，用配置目录）。
     /// 低频字段（启动 + 设置页读写），不值得为它发明解析层，存原始值即可。
     log_dir: Option<String>,
@@ -519,6 +525,7 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
     let queue = queue_from(&raw);
     let captcha_pool = captcha_pool_from(&raw);
     let routing = routing_from(&raw);
+    let pinned_upstream = pinned_upstream_from(&raw);
     RuntimeConfig {
         // 文件里有就用文件的，否则环境变量兜底（对应 `if (config.apiKey && !opts.apiKey)`）。
         // 这里存的是**磁盘原值**：`apiKey` 从本轮改造起可能是 `enc1:` 信封（顶层旧
@@ -537,6 +544,7 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
         queue,
         captcha_pool,
         routing,
+        pinned_upstream,
         log_dir: string_field(&raw, KEY_LOG_DIR),
         request_stats_dir: string_field(&raw, KEY_REQUEST_STATS_DIR),
         debug_dir: string_field(&raw, KEY_DEBUG_DIR),
@@ -1482,6 +1490,102 @@ pub fn set_retry(patch: RetryPatch) -> bool {
         }
         config.retry = next;
     })
+}
+
+// ─── 固定上游 IP（pinnedUpstreamIp）────────────────────────────
+
+/// 只取固定上游 IP 设置的轻量读取（**不克隆整份 raw**）。
+///
+/// 与 `retry_settings()` 同一取舍：转发层每轮失败判定都要问一次「要不要切」，
+/// 而 `current()` 会克隆整个 `raw` Map。读锁取一份快照克隆（两个列表是 `Arc`，
+/// 克隆只付一次指针自增）。未初始化时给默认值。
+pub fn pinned_upstream_settings() -> PinnedUpstreamSettings {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.pinned_upstream.clone();
+        }
+    }
+    PinnedUpstreamSettings::default()
+}
+
+/// 写固定上游 IP 设置，返回「IP 列表是否变了」。
+///
+/// 返回值是给调用方做**重置动作**用的：列表一变，组当前 IP 与所有账号的独立
+/// IP 都必须回到「跟随组」（见 ADR-0001 决定 7）。这个判断只能在这里做 ——
+/// 调用方（HTTP 处理器）拿到的是 patch，看不到旧值。
+///
+/// 内存快照与 raw 底稿一起改，与 `set_retry` 同一模式。`current_ip` 单独处理：
+/// 列表变更时它**不能**沿用旧值（旧值大概率已不在新列表里），由这里直接取
+/// 新列表首项；只改开关 / 超时 / 状态码时它原样保留。
+pub fn set_pinned_upstream(patch: PinnedUpstreamPatch) -> bool {
+    let mut ips_changed = false;
+    update(|config| {
+        let mut next = config.pinned_upstream.clone();
+        if let Some(enabled) = patch.enabled {
+            next.enabled = enabled;
+        }
+        if let Some(ips) = &patch.ips {
+            if next.ips.iter().map(String::as_str).ne(ips.iter().map(String::as_str)) {
+                ips_changed = true;
+                next.current_ip = ips.first().cloned().unwrap_or_default();
+            }
+            next.ips = std::sync::Arc::from(ips.as_slice());
+        }
+        if let Some(seconds) = patch.wait_timeout_seconds {
+            next.wait_timeout_seconds = seconds;
+        }
+        if let Some(codes) = &patch.status_codes {
+            next.status_codes = std::sync::Arc::from(codes.as_slice());
+        }
+        // 显式的 current_ip 写入（组标题后那个切换按钮走这条）只在它确实在
+        // 新列表里时才采纳；写进来的悬空值一律忽略 —— 与读侧的兜底同一口径。
+        if let Some(current) = &patch.current_ip {
+            if next.ips.iter().any(|ip| ip == current) {
+                next.current_ip = current.clone();
+            }
+        }
+        // 「开关打开但一个 IP 都没有」在内存里也一并收掉，避免快照与实际行为
+        // 出现两种说法（读侧解析时已经这么做过一次）。
+        if next.enabled && next.ips.is_empty() {
+            next.enabled = false;
+        }
+        config.raw.insert(
+            KEY_PINNED_UPSTREAM_IP.to_string(),
+            pinned_upstream_value(&next),
+        );
+        config.pinned_upstream = next;
+    });
+    ips_changed
+}
+
+/// 把快照还原成落库形态（与 API 响应体同形）。
+///
+/// 读侧解析与写侧落库共用这一个函数，保证「存进去的」与「读出来的」不会因为
+/// 两处各写一份字段名而漂移 —— 那类漂移不报错，只会让某一项永远停在默认值。
+fn pinned_upstream_value(settings: &PinnedUpstreamSettings) -> Value {
+    let ips: Vec<Value> = settings
+        .ips
+        .iter()
+        .map(|ip| Value::String(ip.clone()))
+        .collect();
+    let codes: Vec<Value> = settings
+        .status_codes
+        .iter()
+        .map(|code| Value::from(*code))
+        .collect();
+    let mut group = serde_json::Map::new();
+    group.insert(FIELD_PIN_ENABLED.to_string(), Value::Bool(settings.enabled));
+    group.insert(FIELD_PIN_IPS.to_string(), Value::Array(ips));
+    group.insert(
+        FIELD_PIN_WAIT_TIMEOUT_SECONDS.to_string(),
+        Value::from(settings.wait_timeout_seconds),
+    );
+    group.insert(FIELD_PIN_STATUS_CODES.to_string(), Value::Array(codes));
+    group.insert(
+        FIELD_PIN_CURRENT_IP.to_string(),
+        Value::String(settings.current_ip.clone()),
+    );
+    Value::Object(group)
 }
 
 // ─── 上游请求超时（connectTimeoutSeconds / headersTimeoutSeconds /

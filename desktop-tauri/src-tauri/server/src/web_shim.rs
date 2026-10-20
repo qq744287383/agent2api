@@ -1312,6 +1312,8 @@ pub fn shim_js() -> &'static str {
     runUpgrade: function () { return call('POST', '/api/upgrade/run', {}); },
 
     // ── 请求重试 ──
+    getPinnedUpstream: function () { return call('GET', '/api/pinned-upstream-ip'); },
+    savePinnedUpstream: function (patch) { return call('PUT', '/api/pinned-upstream-ip', patch); },
     getRetry: function () { return call('GET', '/api/retry'); },
     saveRetry: function (patch) { return call('PUT', '/api/retry', patch); },
     // ── 上游请求超时（四项）──

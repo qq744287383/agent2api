@@ -58,6 +58,7 @@ mod route_state;
 pub mod sse;
 pub mod stall;
 pub mod translate;
+pub mod upstream_ip_pin;
 pub mod usage;
 
 use std::collections::HashMap;
@@ -285,6 +286,12 @@ pub(super) struct RouteTarget {
     /// `None` = 没走到账号选路（候选集合为空、用默认登录态直发）。
     /// 由转发层挂进 telemetry 落进请求日志；这里只是**捎带**，不参与转发。
     pub decision: Option<Value>,
+    /// 本次要钉的上游地址（`None` = 不固定）。
+    ///
+    /// 由选路层算好（它同时知道「账号是谁」与「这次会不会走代理」），
+    /// 转发层只负责照着发 —— 失败了再前进到下一个（见
+    /// `provider_loop::advance_pin_and_switch`）。
+    pub pin: Option<crate::server::core::upstream::upstream_ip_pin::PinTarget>,
 }
 
 impl UpstreamService {

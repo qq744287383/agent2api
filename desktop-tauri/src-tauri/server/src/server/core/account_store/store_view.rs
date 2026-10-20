@@ -436,6 +436,19 @@ impl AccountStore {
                 // 见 apply_patch）。恒为布尔而不是缺键：界面据此决定「备注名赢过
                 // 邮箱 / 昵称等默认口径」还是「维持原展示行为」，两种形态都不必
                 // 再判「字段缺失」。
+                // 账号级固定上游 IP（缺失 = 跟随组）。跨家统一注入的理由与上面
+                // 四条相同，但它**只在 WorkBuddy 国际版上生效** —— 别家的账号
+                // 就算带着这个字段，转发层也不会去读（固定上游 IP 的开关与 IP
+                // 列表都是 provider 级的，见 `config::pinned_upstream_settings`）。
+                // 恒为「字符串或 Null」而不是缺键：界面据此决定下拉里显示的是
+                // 「跟随组」还是某个 IP，两种形态不必再判「字段缺失」。
+                fields.insert(
+                    "pinnedUpstreamIp".to_string(),
+                    match record.pinned_upstream_ip() {
+                        Some(ip) => Value::String(ip),
+                        None => Value::Null,
+                    },
+                );
                 fields.insert(
                     "nameCustom".to_string(),
                     Value::Bool(

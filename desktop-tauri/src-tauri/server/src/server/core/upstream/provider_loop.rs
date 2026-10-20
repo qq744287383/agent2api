@@ -92,6 +92,7 @@ use crate::server::logging;
 
 use super::payload::{send_body, ProviderContext, SendBody};
 use super::request::{read_upstream_error, send_chat_request, TransportRequest};
+use super::upstream_ip_pin;
 use super::usage::LogPhase;
 use super::{
     account_display, account_label, cancellation, connections::ConnectionGuard, describe_proxy,
@@ -106,6 +107,15 @@ mod tests;
 struct OutboundFailure {
     /// 适配器给出的分类（决定编排动作）
     class: UpstreamErrorClass,
+    /// 这次失败是「等待响应超时」而不是拿到了一个错误响应。
+    ///
+    /// ── 为什么要单独带一个布尔 ──────────────────────────────────
+    /// 传输层失败被统一收敛成 `Fatal { status: 502 }`（与 Node 的 fetchViaProxy
+    /// 一致），于是「上游真的回了 502」与「压根没等到响应」在 `class` 上长得
+    /// 一模一样 —— 而固定上游 IP 的切换判据必须区分这两者：前者要比对用户填的
+    /// 状态码名单，后者已经有自己的判据（见 ADR-0001 决定 4 与「502 的歧义」）。
+    /// 这个布尔只由 `UpstreamRequestError.reason` 的前缀决定，不引入新的错误类型。
+    timed_out: bool,
     /// 给客户端的网关错误（状态码 / 文案 / 上游码）。
     ///
     /// 限额记录与事件上报也读它的 `message` —— 改造前 `markAccountLimited`
@@ -238,6 +248,209 @@ fn defer_to_next_account(
         ),
     );
     true
+}
+
+/// 一次固定上游 IP 切换的结果（供日志与尝试明细使用）。
+///
+/// 字段是**已经渲染好**的文案 + 结构化数据两份：文案进尝试明细（用户在请求
+/// 日志里悬停就能看到），结构化数据进 `log_event` 的 JSON 列（面板可按原因
+/// 筛选）。两者同源，不会出现「日志说 A、明细说 B」。
+struct PinSwitch {
+    note: String,
+    from_ip: String,
+    to_ip: String,
+    from_account: String,
+    to_account: String,
+    reason: &'static str,
+    status: Option<i64>,
+}
+
+/// 这一次失败要不要触发固定上游 IP 的切换。
+///
+/// 三个条件缺一不可：这次请求确实钉了一个地址（`pin` 有值）、失败是
+/// 「等待响应超时」或「上游真实返回的状态码在名单里」。
+///
+/// 配置在这里现读（不在请求开头快照一份）：切换判据只在这条失败路径上问一次，
+/// 读锁的开销相对一次上游往返可以忽略；而现读的好处是用户改完名单，**下一个
+/// 失败**就按新口径走。
+fn pin_switch_due(
+    failure: &OutboundFailure,
+    pin: Option<&upstream_ip_pin::PinTarget>,
+) -> bool {
+    if pin.is_none() {
+        return false;
+    }
+    if failure.timed_out {
+        return true;
+    }
+    let status = failure.error.status_code;
+    u16::try_from(status)
+        .map(|code| config::pinned_upstream_settings().switches_on(code))
+        .unwrap_or(false)
+}
+
+/// 前进一个 IP 并换下一个账号；没有下一个账号时返回 `None`。
+///
+/// 两件事一起做（ADR-0001 决定 4）：IP 前进（组策略推进游标并写回配置，
+/// 账号策略改写该账号记录）与换账号。IP 列表轮完一圈回到头部（决定 5），
+/// 唯一的终点是换号预算。
+#[allow(clippy::too_many_arguments)]
+fn advance_pin_and_switch(
+    service: &UpstreamService,
+    cursor: &mut Option<upstream_ip_pin::IpCursor>,
+    provider_ids: &[&str],
+    cooldown_keys: &rotate::CooldownKeys<'_>,
+    tried_ids: &mut Vec<String>,
+    target: &RouteTarget,
+    session: &Value,
+    failure: &OutboundFailure,
+    switches_left: &mut usize,
+    switch_total: usize,
+    pinned: Option<&str>,
+) -> Option<PinSwitch> {
+    let settings = config::pinned_upstream_settings();
+    let from_ip = target
+        .pin
+        .as_ref()
+        .map(|pin| pin.ip.to_string())
+        .unwrap_or_default();
+    let from_account = account_label(
+        target.account.as_ref(),
+        &target.account_id.clone().unwrap_or_default(),
+        session,
+    );
+
+    // ── 1. 换下一个账号（先问有没有人，再扣预算）──────────────────
+    // 顺序与 `defer_to_next_account` 一致：队列里没人时这次失败就是终态，
+    // 不该白吃一个换号额度。
+    if let Some(account_id) = target.account_id.clone() {
+        if !tried_ids.contains(&account_id) {
+            tried_ids.push(account_id);
+        }
+    }
+    let next = rotate::pick_next_account(service, provider_ids, cooldown_keys, tried_ids, pinned)?;
+    if !take_switch(switches_left, switch_total) {
+        return None;
+    }
+
+    // ── 2. 前进 IP ──────────────────────────────────────────────
+    // 账号策略（该账号自己有独立 IP）改写的是**账号记录**，组策略推进游标并
+    // 写回组当前 IP（ADR-0001 决定 6：直接改写，不是只在本次请求内临时前进）。
+    let account_scoped = target
+        .account
+        .as_ref()
+        .and_then(|account| account.get("pinnedUpstreamIp"))
+        .and_then(Value::as_str)
+        .is_some();
+    let to_ip = if account_scoped {
+        advance_account_pin(service, target, &settings, &next).unwrap_or_default()
+    } else {
+        let cursor = cursor.get_or_insert_with(|| {
+            upstream_ip_pin::IpCursor::new(&settings.ips, settings.effective_current_ip())
+        });
+        let picked = cursor.next().map(str::to_string).unwrap_or_default();
+        if !picked.is_empty() {
+            // 写回组当前 IP：让面板组标题后的显示与实际一致，也让重启后接着用
+            let mut patch = config::PinnedUpstreamPatch::default();
+            patch.current_ip = Some(picked.clone());
+            config::set_pinned_upstream(patch);
+        }
+        picked
+    };
+
+    let to_account = account_display(&next);
+    let reason = if failure.timed_out { "timeout" } else { "status" };
+    let reason_text = if failure.timed_out {
+        format!("等待响应超时（{}秒）", config::timeout_settings().headers_seconds)
+    } else {
+        format!("上游返回 HTTP {}", failure.error.status_code)
+    };
+    let note = format!(
+        "固定上游 IP 切换：{reason_text} → {from_ip} 换成 {to_ip}，账号 {from_account} → {to_account}"
+    );
+    // 终端也留一行：用户排查「为什么这次请求的账号与 IP 对不上」时，
+    // 运行日志是最先看的地方
+    logging::console_line("[Upstream]", &format!("⚠️ {note}"));
+    Some(PinSwitch {
+        note,
+        from_ip,
+        to_ip,
+        from_account,
+        to_account,
+        reason,
+        status: if failure.timed_out { None } else { Some(i64::from(failure.error.status_code)) },
+    })
+}
+
+/// 账号策略：把**这个账号**的独立 IP 前进到列表里的下一个并写回记录。
+///
+/// 返回新写入的 IP（写失败时返回 `None`，调用方按空字符串记日志 —— 那次切换
+/// 其实只换了账号，如实反映比编一个 IP 出来好）。
+fn advance_account_pin(
+    service: &UpstreamService,
+    target: &RouteTarget,
+    settings: &config::PinnedUpstreamSettings,
+    _next: &Value,
+) -> Option<String> {
+    let account_id = target.account_id.clone()?;
+    let current = target
+        .account
+        .as_ref()
+        .and_then(|account| account.get("pinnedUpstreamIp"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let mut cursor = upstream_ip_pin::IpCursor::new(&settings.ips, current.as_deref());
+    let picked = cursor.next().map(str::to_string)?;
+    let patch = serde_json::json!({ "pinnedUpstreamIp": picked });
+    match service.store.update_account(&account_id, &patch) {
+        Ok(_) => Some(picked),
+        Err(error) => {
+            logging::log(
+                "[Upstream]",
+                &format!("⚠️ 改写账号 {account_id} 的固定上游 IP 失败: {}", error.message),
+            );
+            None
+        }
+    }
+}
+
+/// 把一次切换记进结构化日志（每次切换各一行，见 ADR-0001 决定与 issue 的用户故事 29）。
+fn note_ip_switch(
+    telemetry: &crate::server::core::upstream::usage::RequestTelemetry,
+    switch: &PinSwitch,
+    failure: &OutboundFailure,
+) {
+    let attempt = telemetry.snapshot().attempts.max(1);
+    let _ = (failure, attempt);
+    logging::log_event(
+        "warn",
+        "upstream",
+        &switch.note,
+        Some(serde_json::json!({
+            "kind": "upstream_ip_switch",
+            "reason": switch.reason,
+            "status": switch.status,
+            "fromIp": switch.from_ip,
+            "toIp": switch.to_ip,
+            "fromAccount": switch.from_account,
+            "toAccount": switch.to_account,
+        })),
+    );
+}
+
+/// 这次传输层失败是不是「等响应超时」。
+///
+/// ── 为什么按文案前缀判而不是加字段 ──────────────────────────
+/// `UpstreamRequestError.reason` 已经是「这次为什么失败」的规范形态（三种：
+/// `等待响应超时(N秒)` / `连接中超时(N秒)` / `上游连接失败`），重试链的展示
+/// 文案就是它。再加一个枚举字段只是为了这一处判据，等于给同一个事实第二份
+/// 表达，而两处迟早漂移。
+///
+/// **必须区分**：连接超时说明连不上（该 IP 不可达），而等待响应超时说明连上
+/// 了但上游不吭声（可能只是模型慢）。固定上游 IP 的切换判据只认后者 ——
+/// 用户填的秒数说的是「等多久算这条线路不行」，不是「建连多久算失败」。
+fn is_wait_timeout(error: &super::request::UpstreamRequestError) -> bool {
+    error.reason.starts_with("等待响应超时")
 }
 
 /// 瞬时 HTTP 状态码：适配器没声明专属重试时，按全局重试设置原样重发再看一眼。
@@ -568,6 +781,13 @@ async fn attempt_queue(
     let mut budget = RetryBudget::new(settings.resend_budget());
     let switch_total = settings.switch_budget();
     let mut switches_left = switch_total;
+    // 固定上游 IP 的组策略游标：整份请求共用一份，从组当前 IP 之后开始。
+    //
+    // 懒建（第一次真的要切时才按当时的配置建）：绝大多数请求一次都不会切，
+    // 而建游标要读一次配置。`None` 同时表示「还没切过」。
+    let mut pin_cursor: Option<upstream_ip_pin::IpCursor> = None;
+    // 「固定上游 IP 被代理挡下」的提示只记一次（见下面那一处）
+    let mut pin_notice_sent = false;
     // ── 系统提示词的降级标记（对应参考项目的 `degradedApplied`）────────
     // `true` = **降级期已生效**：进入本请求时降级期已经开着（状态机在别的请求
     // 里被触发过），或本请求撞了内容拦截后由下面「动作 0」置位。置位后不再重复
@@ -937,6 +1157,27 @@ async fn attempt_queue(
         if let Some(notice) = target.proxy_notice.as_deref() {
             ctx.telemetry.note_attempt_notice(notice);
         }
+        // 固定上游 IP 被代理挡下的提示：用户开着这个功能、也配了代理，于是
+        // 它**静默不生效** —— 没有这一行，他只能靠抓包才发现。每次请求只记
+        // 一次（`pin_notice_sent` 闸），不随账号轮换重复刷屏。
+        if !pin_notice_sent
+            && config::pinned_upstream_settings().enabled
+            && target.proxy.is_some()
+        {
+            pin_notice_sent = true;
+            let notice = "该账号走出网代理，固定上游 IP 不生效（代理决定 DNS 解析）";
+            ctx.telemetry.note_attempt_notice(notice);
+            logging::log_event(
+                "info",
+                "upstream",
+                notice,
+                Some(serde_json::json!({
+                    "kind": "upstream_ip_pin_ignored",
+                    "provider": provider_id,
+                    "reason": "proxy",
+                })),
+            );
+        }
 
         // ── 内容处理：凭证已就绪、这一家**即将发送**，此刻才决定发送体 ────
         // 位置在选路/凭证之后：没有可用账号（上面的 503/401 提前返回）的请求
@@ -1084,6 +1325,13 @@ async fn attempt_queue(
                 // 能力位由适配器给；账号已配代理或本次显式指定了直连/节点时它不参与
                 system_proxy_when_unset: ctx.proxy_override.is_none()
                     && adapter.system_proxy_when_unset(),
+                // 固定上游 IP：账号独立 IP 优先，否则组当前 IP；走代理时不生效。
+                // 在这里算而不是在发送层，是因为只有这里同时拿得到「账号是谁」
+                // 与「这次会不会走代理」—— 发送层只有一份 TransportRequest。
+                pin: upstream_ip_pin::pin_for_account_value(
+                    target.account.as_ref(),
+                    target.proxy.is_some(),
+                ),
             };
             // ── 调试模式：抓一份即将发出去的原始报文 ──────────────────
             // 位置在 `build_chat_request` 之后（URL / 头 / body 都已定稿）。
@@ -1292,6 +1540,38 @@ async fn attempt_queue(
                         Some(i64::from(failure.error.status_code)),
                         Some(&failure.error.message),
                     );
+                    // ── 动作 0.5：固定上游 IP 的切换（超时 / 命中切换状态码）──
+                    //
+                    // 判据见 ADR-0001 决定 4：「等待响应超时」或「上游真实返回的
+                    // 状态码在用户名单里」。两者都意味着**这条线路眼下不行**，
+                    // 而继续在原账号上重发不引入任何新变量 —— 所以这里直接
+                    // 前进 IP 并换账号，不消耗原地重发预算。
+                    //
+                    // ── 为什么状态码要判 `!failure.timed_out` ────────────
+                    // 传输层失败被统一收敛成 `Fatal{status:502}`，与上游真的回
+                    // 502 在 `class` 上同形。不区分的话，一次「连不上」会被当成
+                    // 「命中了用户填的 502」再切一次，IP 消耗速度翻倍而原因记错。
+                    if !named_switch && pin_switch_due(&failure, target.pin.as_ref()) {
+                        if let Some(switch) = advance_pin_and_switch(
+                            service,
+                            &mut pin_cursor,
+                            provider_ids,
+                            &cooldown_keys,
+                            &mut tried_ids,
+                            &target,
+                            &session,
+                            &failure,
+                            &mut switches_left,
+                            switch_total,
+                            ctx.pinned_account,
+                        ) {
+                            // 切 IP 与换号是同一次动作（ADR-0001 决定 4）：
+                            // 记录里要能同时看到 IP 与账号各自的 from/to
+                            ctx.telemetry.note_attempt_retry(&switch.note, None, 0);
+                            note_ip_switch(ctx.telemetry, &switch, &failure);
+                            continue 'accounts;
+                        }
+                    }
                     // ── 动作 1：限额 → 标记冷却 + 换下一个账号 ──────────
                     if let (
                         UpstreamErrorClass::QuotaLimited {
@@ -2358,6 +2638,9 @@ fn cancelled_failure() -> OutboundFailure {
             upstream_code: None,
         },
         error: cancellation::cancelled_error(),
+        // 手动终止不是链路超时：它有自己的判定（调用方按令牌短路），不该被
+        // 固定上游 IP 的「切换」判据误当成「这条线路不行了」
+        timed_out: false,
     }
 }
 
@@ -2476,6 +2759,9 @@ async fn send_with_retry(
                         upstream_code: None,
                     },
                     error: gateway,
+                    // 判据取自错误自带的简短原因（`等待响应超时(N秒)`），
+                    // 不新造错误类型 —— 那条 reason 本来就是给重试链展示用的
+                    timed_out: is_wait_timeout(&error),
                 });
             }
         };
@@ -2563,7 +2849,9 @@ async fn send_with_retry(
                     .with_optional_code(detail.code)
             }
         };
-        return Err(OutboundFailure { class, error });
+        // 走到这里说明上游**真的回了**一个错误响应（状态码 + 报文），
+        // 所以永远不是传输层超时 —— 固定上游 IP 的判据要比对的是它的状态码
+        return Err(OutboundFailure { class, error, timed_out: false });
     }
 }
 

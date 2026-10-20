@@ -800,6 +800,14 @@ const BRIDGE_JS: &str = r#"
     getRetry: () => call('GET', '/api/retry'),
     saveRetry: patch => call('PUT', '/api/retry', patch),
 
+    // ── 固定上游 IP（账号页 WorkBuddy 国际版组菜单）──
+    // provider 级的开关 / IP 列表 / 超时 / 切换状态码，存配置
+    // （/api/pinned-upstream-ip）。契约同 saveRetry：PUT 允许部分字段，
+    // 返回生效后的全量值。**注意它有副作用** —— IP 列表一变，该组账号的
+    // 独立 IP 会被后端重置为「跟随组」。
+    getPinnedUpstream: () => call('GET', '/api/pinned-upstream-ip'),
+    savePinnedUpstream: patch => call('PUT', '/api/pinned-upstream-ip', patch),
+
     // ── 上游请求超时（设置页「通用 → 请求超时」）──
     // 四项秒数（连接 / 等待响应 / 流式空闲 / 非流式响应体），存配置（/api/timeouts）。
     // 契约同 saveRetry：PUT 允许部分字段，返回生效后的全量值。

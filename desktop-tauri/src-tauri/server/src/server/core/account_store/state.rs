@@ -374,6 +374,31 @@ impl StoredAccount {
         self.fields.insert("proxy".to_string(), proxy);
     }
 
+    /// 该账号单独指定的固定上游 IP（缺失 / 空串 = 跟随组）。
+    ///
+    /// 与 `proxy` 不同，这是一个**可缺省**的标量：代理的「没配」要落成
+    /// `Value::Null` 才能被 `resolve_account_proxy` 识别，而固定上游 IP 的
+    /// 「没配」就是字段不存在 —— 写一个空串进去反而会让读侧多一条「有值但为空」
+    /// 的分支。语义见 GLOSSARY 的「组策略 / 账号策略」。
+    pub fn pinned_upstream_ip(&self) -> Option<String> {
+        as_optional_text(self.fields.get("pinnedUpstreamIp"))
+    }
+
+    /// 写入 / 清除该账号的固定上游 IP（`None` 或空串 = 清除，回到跟随组）。
+    pub fn set_pinned_upstream_ip(&mut self, value: Option<&str>) {
+        match value.map(str::trim).filter(|text| !text.is_empty()) {
+            Some(text) => {
+                self.fields.insert(
+                    "pinnedUpstreamIp".to_string(),
+                    Value::String(text.to_string()),
+                );
+            }
+            None => {
+                self.fields.remove("pinnedUpstreamIp");
+            }
+        }
+    }
+
     // ── ZCode 账号字段 ──────────────────────────────────────
 
     /// 设备标识（`X-Device-Mid`）：领取与余额查询都要带，上游要求 **UUID 形态**

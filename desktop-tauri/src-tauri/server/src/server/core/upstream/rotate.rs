@@ -138,6 +138,7 @@ pub(super) async fn select_target_account(
             priority: None,
             proxy_notice: None,
             decision: None,
+            pin: None,
         });
     }
 
@@ -308,6 +309,7 @@ pub(super) async fn select_target_account(
         priority: None,
         proxy_notice: None,
         decision: Some(decision),
+        pin: None,
     })
 }
 
@@ -404,6 +406,13 @@ pub(super) fn with_proxy_notice(
             None
         }
     };
+    // 固定上游 IP：在这里算是因为本函数同时拿得到账号记录与「这次会不会
+    // 走代理」（`resolved` 刚刚解析过）。代理优先的判据在 pin 模块里。
+    // 必须在 `account` / `resolved` 被移进结构体**之前**算。
+    let pin = crate::server::core::upstream::upstream_ip_pin::pin_for_account_value(
+        Some(&account),
+        resolved.is_some(),
+    );
     RouteTarget {
         provider: provider_of(&account).to_string(),
         account_id: Some(account_id),
@@ -411,6 +420,7 @@ pub(super) fn with_proxy_notice(
         account: Some(account),
         proxy: resolved,
         proxy_notice: notice,
+        pin,
         decision,
     }
 }

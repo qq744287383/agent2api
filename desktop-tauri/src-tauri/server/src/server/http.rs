@@ -296,6 +296,14 @@ pub fn panel_router(state: ServerState) -> Router {
             "/api/retry",
             get(api::retry_api::get_retry).put(api::retry_api::put_retry),
         )
+        // 固定上游 IP：GET 读、PUT（允许部分字段）更新。
+        // 独立成端点的理由与 /api/retry 相同，但它**有副作用** —— IP 列表一变，
+        // 该组所有账号的独立 IP 会被重置为「跟随组」（见该模块头与 ADR-0001）
+        .route(
+            "/api/pinned-upstream-ip",
+            get(api::pinned_upstream::get_pinned_upstream)
+                .put(api::pinned_upstream::put_pinned_upstream),
+        )
         // 上游请求超时（四项）：GET 读、PUT（允许部分字段）更新。
         // 与 /api/retry 同一模式、同一理由独立成端点：保存后对下一个请求
         // 立即生效（连接超时经由出网客户端，其余三项在各阶段自己的计时器上）。

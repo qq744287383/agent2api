@@ -1220,3 +1220,135 @@ pub struct AutoContinuePatch {
     /// `AUTO_CONTINUE_MIN_ROUNDS..=AUTO_CONTINUE_MAX_ROUNDS` 校验过。
     pub max_rounds: Option<i64>,
 }
+
+// ─── 固定上游 IP（pinnedUpstreamIp，账号页 WorkBuddy 国际版组菜单）──────
+
+/// 固定上游 IP 的总配置键（config.json 键）。
+///
+/// 值是**一个对象**而不是散成多个顶层键：这几项总是一起读（转发层每轮失败
+/// 判定都要问「开关开了没 / 当前 IP 是谁 / 超时多少 / 哪些码要切」），打包成
+/// 一个值让调用方一次取到完整快照；散成五个键则要么读五次锁、要么自己拼。
+///
+/// ── 为什么这一项没有环境变量兜底 ────────────────────────────
+/// 同一套里别的项（自动续写、验证码开关）有环境变量那一级，是因为它们要
+/// 在容器里一键调整。固定上游 IP 要填的是**一组 IP 字面量**，环境变量表达
+/// 数组只有逗号分隔一种写法，而 IP 列表本身还在界面上带逐行校验 —— 两套
+/// 解析口径必然漂移。需要脚本化时走 HTTP API，不另开一条隐蔽通道。
+pub const KEY_PINNED_UPSTREAM_IP: &str = "pinnedUpstreamIp";
+
+/// 固定上游 IP 的对象字段名（`pinnedUpstreamIp` 内部）。
+pub const FIELD_PIN_ENABLED: &str = "enabled";
+pub const FIELD_PIN_IPS: &str = "ips";
+pub const FIELD_PIN_WAIT_TIMEOUT_SECONDS: &str = "waitTimeoutSeconds";
+pub const FIELD_PIN_STATUS_CODES: &str = "statusCodes";
+pub const FIELD_PIN_CURRENT_IP: &str = "currentIp";
+
+/// 默认关闭。
+///
+/// 必须默认关：打开它意味着「所有上游请求改走用户给的那几个 IP」，而存量
+/// 用户的 IP 列表是空的 —— 默认开会让每个人的国际版请求都失效（没有 IP 可用
+/// 时按未开启处理，但那是兜底，不是默认值该有的形状）。
+pub const DEFAULT_PIN_ENABLED: bool = false;
+/// 等待响应超时默认 0 = 跟随设置页的全局 `headersTimeoutSeconds`。
+///
+/// 不在这里写死一个秒数：全局那个值用户已经调过了，两处各有一个数字又互不
+/// 相干，只会让人不知道最终生效的是哪个。0 的语义是「沿用全局」。
+pub const DEFAULT_PIN_WAIT_TIMEOUT_SECONDS: i64 = 0;
+/// 切换状态码默认 `[502]`。
+///
+/// 502 是「上游网关说这条链路不通」最典型的形态，作为起点比空名单有用；
+/// 空名单仍可由用户显式保存（= 只按超时判）。
+pub const DEFAULT_PIN_STATUS_CODES: &[u16] = &[502];
+
+/// IP 列表的长度上限：50 项。
+///
+/// 与「不重试状态码」同一口径。轮询会绕圈，列太多既没有意义，也会让界面与
+/// 配置行变得难以扫读。
+pub const PIN_MAX_IPS: usize = 50;
+/// 状态码名单上限：与 `RETRY_MAX_NO_RETRY_CODES` 一致（HTTP 状态码总共 500 个）。
+pub const PIN_MAX_STATUS_CODES: usize = 50;
+/// 等待响应超时的合法范围（秒）。0 单独表示「跟随全局」，不走这个范围。
+///
+/// 下限 1：0 已被「跟随全局」占用，写 0 秒等于禁用保护。上限 3600 与
+/// `TIMEOUT_MAX_SECONDS` 对齐 —— 填更大的值不会更严，只会让用户以为保护失效。
+pub const PIN_MIN_WAIT_TIMEOUT_SECONDS: i64 = 1;
+pub const PIN_MAX_WAIT_TIMEOUT_SECONDS: i64 = 3600;
+
+/// 固定上游 IP 设置（账号页 WorkBuddy 国际版组菜单的弹窗）。
+///
+/// 与 `RetrySettings` 同一取舍：几个值总是一起用（转发层每轮失败判定都取），
+/// 打包成一个快照值让调用方一次拿到、不必多次读锁。两个列表都用 `Arc` 持有，
+/// 克隆只付一次指针自增。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PinnedUpstreamSettings {
+    /// 总开关（关掉时下面所有字段只是「留着备用」，不生效）
+    pub enabled: bool,
+    /// IP 列表（IPv4 字面量，已排序去重）
+    pub ips: Arc<[String]>,
+    /// 等待响应超时（秒）；0 = 跟随全局 `headersTimeoutSeconds`
+    pub wait_timeout_seconds: i64,
+    /// 切换到下一个 IP 的状态码名单（只比对上游**真实返回**的码）
+    pub status_codes: Arc<[u16]>,
+    /// 组当前 IP（持久化；空 = 还没选过，按列表首项处理）
+    pub current_ip: String,
+}
+
+impl PinnedUpstreamSettings {
+    /// 这一组当前生效的 IP（`None` = 没有可用 IP，等同于未启用）。
+    ///
+    /// 取 [`Self::current_ip`]，但它不在列表里时（用户改过列表、或手改了库）
+    /// 回落列表首项 —— 悬空的 current_ip 不该让整组失效。
+    pub fn effective_current_ip(&self) -> Option<&str> {
+        if !self.enabled {
+            return None;
+        }
+        let current = self.current_ip.trim();
+        if !current.is_empty() && self.ips.iter().any(|ip| ip == current) {
+            return Some(current);
+        }
+        self.ips.first().map(String::as_str)
+    }
+
+    /// 生效的等待响应超时（秒）：0 = 跟随全局，否则取「用户值」与「全局值」
+    /// 的较小者。
+    ///
+    /// ── 为什么取较小者而不是直接写入侧拒掉更大值 ────────────────
+    /// 用户在同一屏上会看到两个数字（全局 300、这里填 600）。在写入侧拒掉
+    /// 600 意味着他得先去设置页改全局，再回来改这里 —— 而他真正想表达的
+    /// 只是「比全局更严」，填大了没有额外语义。取较小者让「填大了」表现为
+    /// 「按全局生效」，界面明示当前全局值即可，不必制造一次失败。
+    pub fn effective_wait_timeout_seconds(&self, global_seconds: i64) -> i64 {
+        let global = global_seconds.max(PIN_MIN_WAIT_TIMEOUT_SECONDS);
+        if self.wait_timeout_seconds <= 0 {
+            return global;
+        }
+        self.wait_timeout_seconds.min(global)
+    }
+
+    /// 这个状态码是否要触发切换。
+    pub fn switches_on(&self, status: u16) -> bool {
+        self.status_codes.contains(&status)
+    }
+}
+
+impl Default for PinnedUpstreamSettings {
+    fn default() -> Self {
+        Self {
+            enabled: DEFAULT_PIN_ENABLED,
+            ips: Arc::from(Vec::<String>::new()),
+            wait_timeout_seconds: DEFAULT_PIN_WAIT_TIMEOUT_SECONDS,
+            status_codes: Arc::from(DEFAULT_PIN_STATUS_CODES),
+            current_ip: String::new(),
+        }
+    }
+}
+
+/// 固定上游 IP 的**部分**更新入参（`None` = 该项不动）。
+#[derive(Clone, Debug, Default)]
+pub struct PinnedUpstreamPatch {
+    pub enabled: Option<bool>,
+    pub ips: Option<Vec<String>>,
+    pub wait_timeout_seconds: Option<i64>,
+    pub status_codes: Option<Vec<u16>>,
+    pub current_ip: Option<String>,
+}

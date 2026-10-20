@@ -711,3 +711,294 @@ mod tests {
         );
     }
 }
+
+// ─── 固定上游 IP 的解析（pinnedUpstreamIp.*）──────────────────
+
+/// 由原始 JSON 解析固定上游 IP 设置。
+///
+/// 值是一个对象；键缺失 / 不是对象 / 字段写坏都按模块头的口径**回落默认值**，
+/// 不报错也不夹紧。三个列表字段各有自己的「垃圾项」规则（见下）。
+pub(super) fn pinned_upstream_from(map: &Map<String, Value>) -> PinnedUpstreamSettings {
+    let defaults = PinnedUpstreamSettings::default();
+    let Some(Value::Object(group)) = map.get(KEY_PINNED_UPSTREAM_IP) else {
+        return defaults;
+    };
+    let ips = pin_ips_field(group);
+    let enabled = group
+        .get(FIELD_PIN_ENABLED)
+        .and_then(Value::as_bool)
+        .unwrap_or(DEFAULT_PIN_ENABLED);
+    // 开关打开但一个 IP 都没有 = 未启用。把这条判据收在这里而不是每个调用方，
+    // 是为了让「开了但没填」永远不会变成「所有请求都发不出去」。
+    let enabled = enabled && !ips.is_empty();
+    PinnedUpstreamSettings {
+        enabled,
+        ips: std::sync::Arc::clone(&ips),
+        wait_timeout_seconds: pinned_wait_timeout_field(group),
+        status_codes: pin_status_codes_field(group),
+        current_ip: pinned_current_ip_field(group, &ips),
+    }
+}
+
+/// IP 列表的解析。
+///
+/// ── 各形态的落点 ────────────────────────────────────────────
+///   - 键缺失 / 不是数组 → **空列表**（= 未配置；配合上面那条判据即「未启用」）
+///   - 空数组 → **空列表**（用户的明确选择，与「没配过」同效：功能不生效）
+///   - 数组里的垃圾项（非字符串 / 不是合法 IPv4）→ **丢弃该项**
+///
+/// 这里与 `no_retry_codes_field` 的差别在于**排序**：状态码排序去重是为了让
+/// 手改过的库可读，而 IP 列表的顺序**就是轮询顺序**，用户排的先后有语义
+/// （他可以把当前最好用的那条放第一个），所以只按出现顺序去重，不排序。
+fn pin_ips_field(group: &Map<String, Value>) -> std::sync::Arc<[String]> {
+    let Some(Value::Array(items)) = group.get(FIELD_PIN_IPS) else {
+        return std::sync::Arc::from(Vec::<String>::new());
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    let mut ips: Vec<String> = Vec::new();
+    for item in items {
+        let Some(text) = item.as_str().map(str::trim) else {
+            continue;
+        };
+        // 只认 IPv4 字面量：带端口、带协议前缀、IPv6、域名一律丢弃。
+        // 用标准库解析而不是自己写点分四段判据 —— 后者会把 1.2.3.999 读成
+        // 合法值，进而在传输层表现为一个永远连不上的地址。
+        if text.parse::<std::net::Ipv4Addr>().is_err() {
+            continue;
+        }
+        if !seen.insert(text.to_string()) {
+            continue;
+        }
+        ips.push(text.to_string());
+        if ips.len() >= PIN_MAX_IPS {
+            break;
+        }
+    }
+    std::sync::Arc::from(ips)
+}
+
+/// 等待响应超时（秒）：0 = 跟随全局，其余必须落在
+/// `PIN_MIN_WAIT_TIMEOUT_SECONDS..=PIN_MAX_WAIT_TIMEOUT_SECONDS`。
+///
+/// **0 不能被当成越界**：它不是「半个合法值」，而是「跟随全局」这个独立语义
+/// （见 `DEFAULT_PIN_WAIT_TIMEOUT_SECONDS`）。所以不能直接套 `bounded_int_field`
+/// 的 1..=3600 —— 那会把 0 回落成默认值，而默认值恰好也是 0，看着一样、
+/// 语义却差一个「用户没填过」的区分。
+fn pinned_wait_timeout_field(group: &Map<String, Value>) -> i64 {
+    let Some(raw) = group.get(FIELD_PIN_WAIT_TIMEOUT_SECONDS) else {
+        return DEFAULT_PIN_WAIT_TIMEOUT_SECONDS;
+    };
+    let number = raw.as_i64().or_else(|| {
+        raw.as_f64()
+            .filter(|value| value.is_finite() && value.fract() == 0.0)
+            .map(|value| value as i64)
+    });
+    match number {
+        Some(0) => 0,
+        Some(seconds) if (PIN_MIN_WAIT_TIMEOUT_SECONDS..=PIN_MAX_WAIT_TIMEOUT_SECONDS).contains(&seconds) => {
+            seconds
+        }
+        _ => DEFAULT_PIN_WAIT_TIMEOUT_SECONDS,
+    }
+}
+
+/// 切换状态码名单：与 `no_retry_codes_field` 逐条同口径（缺失 → 默认名单、
+/// 空数组 → 空名单、垃圾项丢弃、排序去重）。
+fn pin_status_codes_field(group: &Map<String, Value>) -> std::sync::Arc<[u16]> {
+    let Some(Value::Array(items)) = group.get(FIELD_PIN_STATUS_CODES) else {
+        return std::sync::Arc::from(DEFAULT_PIN_STATUS_CODES);
+    };
+    let mut codes: Vec<u16> = items
+        .iter()
+        .filter_map(|item| {
+            let number = item.as_i64().or_else(|| {
+                item.as_f64()
+                    .filter(|raw| raw.is_finite() && raw.fract() == 0.0)
+                    .map(|raw| raw as i64)
+            });
+            u16::try_from(number?)
+                .ok()
+                .filter(|code| (RETRY_CODE_MIN..=RETRY_CODE_MAX).contains(code))
+        })
+        .collect();
+    codes.sort_unstable();
+    codes.dedup();
+    codes.truncate(PIN_MAX_STATUS_CODES);
+    std::sync::Arc::from(codes)
+}
+
+/// 组当前 IP：**必须落在 IP 列表里**，否则回落列表首项。
+///
+/// 悬空的 current_ip 有两个来源：用户改了列表（`set_pinned_upstream` 会重置，
+/// 但那是写侧的事）、手改库。读侧再兜一次，是因为悬空值一旦漏到转发层，
+/// 表现是「整组请求打到一个不在列表里的地址」—— 比回落首项难排查得多。
+fn pinned_current_ip_field(group: &Map<String, Value>, ips: &[String]) -> String {
+    let requested = group
+        .get(FIELD_PIN_CURRENT_IP)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    match requested {
+        Some(text) if ips.iter().any(|ip| ip == text) => text.to_string(),
+        _ => ips.first().cloned().unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod pinned_upstream_tests {
+    //! 固定上游 IP 的**取值口径**：越界回落默认而不是夹紧、垃圾项单独丢弃、
+    //! 以及「开关开了但没有 IP」必须降级成关闭。
+    //!
+    //! ── 为什么这些用例值得单独钉 ────────────────────────────────
+    //! 配置是**手改得到**的东西（`sqlite3` 改 kv 那一行），所以每一个「写坏了
+    //! 会怎样」都必须有确定答案。三条最容易写歪的：
+    //!   - 把 `waitTimeoutSeconds = 0` 当成越界回落默认值 —— 表面看不出来
+    //!     （默认也是 0），但语义差一个「跟随全局」；
+    //!   - 把 IP 列表的垃圾项当成「整份作废」—— 用户手改时写错一行，结果
+    //!     整组 IP 全丢，比他预期的糟得多；
+    //!   - 把「开关开 + 列表空」原样放行 —— 那会让所有国际版请求都钉不到
+    //!     任何地址，比关掉更难排查。
+
+    use super::*;
+    use serde_json::json;
+
+    fn map_of(value: Value) -> Map<String, Value> {
+        let mut map = Map::new();
+        map.insert(KEY_PINNED_UPSTREAM_IP.to_string(), value);
+        map
+    }
+
+    #[test]
+    fn missing_key_yields_the_defaults() {
+        let settings = pinned_upstream_from(&Map::new());
+        assert!(!settings.enabled, "默认必须是关的");
+        assert!(settings.ips.is_empty());
+        assert_eq!(settings.wait_timeout_seconds, 0, "0 = 跟随全局");
+        assert_eq!(&*settings.status_codes, DEFAULT_PIN_STATUS_CODES);
+        assert_eq!(settings.current_ip, "");
+    }
+
+    #[test]
+    fn a_non_object_value_falls_back_to_defaults_instead_of_erroring() {
+        // 手改库把整个对象写成字符串：回落默认，不让人开不了机
+        let settings = pinned_upstream_from(&map_of(json!("1.2.3.4")));
+        assert!(!settings.enabled);
+        assert!(settings.ips.is_empty());
+    }
+
+    #[test]
+    fn only_well_formed_ipv4_literals_survive_and_order_is_kept() {
+        let settings = pinned_upstream_from(&map_of(json!({
+            "enabled": true,
+            "ips": ["2.2.2.2", "not-an-ip", "1.1.1.1", "::1", "1.2.3.999", " 3.3.3.3 ", "2.2.2.2"],
+        })));
+        // 垃圾项逐个丢弃（不是整份作废），合法项按**出现顺序**保留 ——
+        // 顺序就是轮询顺序，用户排的先后有语义
+        assert_eq!(&*settings.ips, &["2.2.2.2", "1.1.1.1", "3.3.3.3"]);
+    }
+
+    #[test]
+    fn the_switch_off_by_an_empty_list_is_reported_as_off() {
+        // 「开了但没有 IP」= 未启用：否则所有请求都会钉不到地址
+        let settings = pinned_upstream_from(&map_of(json!({ "enabled": true, "ips": [] })));
+        assert!(!settings.enabled);
+        assert_eq!(settings.effective_current_ip(), None);
+    }
+
+    #[test]
+    fn zero_means_follow_the_global_value_not_out_of_range() {
+        let settings = pinned_upstream_from(&map_of(json!({
+            "enabled": true,
+            "ips": ["1.1.1.1"],
+            "waitTimeoutSeconds": 0,
+        })));
+        assert_eq!(settings.wait_timeout_seconds, 0);
+        // 生效值 = 全局值
+        assert_eq!(settings.effective_wait_timeout_seconds(300), 300);
+    }
+
+    #[test]
+    fn the_effective_timeout_never_exceeds_the_global_one() {
+        let settings = PinnedUpstreamSettings {
+            enabled: true,
+            wait_timeout_seconds: 600,
+            ..PinnedUpstreamSettings::default()
+        };
+        // 填得比全局大：按全局生效（不是报错，也不是夹紧到别的数字）
+        assert_eq!(settings.effective_wait_timeout_seconds(300), 300);
+        // 填得比全局小：按用户值
+        let stricter = PinnedUpstreamSettings {
+            enabled: true,
+            wait_timeout_seconds: 5,
+            ..PinnedUpstreamSettings::default()
+        };
+        assert_eq!(stricter.effective_wait_timeout_seconds(300), 5);
+    }
+
+    #[test]
+    fn an_out_of_range_timeout_falls_back_to_the_default_not_to_the_bound() {
+        for bad in [json!(-1), json!(99999), json!("5"), json!(5.5), json!(true)] {
+            let settings = pinned_upstream_from(&map_of(json!({
+                "enabled": true,
+                "ips": ["1.1.1.1"],
+                "waitTimeoutSeconds": bad,
+            })));
+            assert_eq!(
+                settings.wait_timeout_seconds, DEFAULT_PIN_WAIT_TIMEOUT_SECONDS,
+                "{bad} 应当回落默认值（回落到边界会让人以为自己的值生效了）"
+            );
+        }
+    }
+
+    #[test]
+    fn status_codes_are_validated_sorted_and_deduplicated() {
+        let settings = pinned_upstream_from(&map_of(json!({
+            "enabled": true,
+            "ips": ["1.1.1.1"],
+            "statusCodes": [503, 99, 502, 700, 502, 429],
+        })));
+        assert_eq!(&*settings.status_codes, &[429u16, 502, 503]);
+    }
+
+    #[test]
+    fn an_explicit_empty_status_list_stays_empty() {
+        // 与「没配过」区分：空名单 = 只按超时判（合法的明确选择）
+        let settings = pinned_upstream_from(&map_of(json!({
+            "enabled": true,
+            "ips": ["1.1.1.1"],
+            "statusCodes": [],
+        })));
+        assert!(settings.status_codes.is_empty());
+        assert!(!settings.switches_on(502));
+    }
+
+    #[test]
+    fn a_dangling_current_ip_falls_back_to_the_first_listed() {
+        let settings = pinned_upstream_from(&map_of(json!({
+            "enabled": true,
+            "ips": ["1.1.1.1", "2.2.2.2"],
+            "currentIp": "9.9.9.9",
+        })));
+        assert_eq!(settings.effective_current_ip(), Some("1.1.1.1"));
+    }
+
+    #[test]
+    fn a_valid_current_ip_is_honoured() {
+        let settings = pinned_upstream_from(&map_of(json!({
+            "enabled": true,
+            "ips": ["1.1.1.1", "2.2.2.2"],
+            "currentIp": "2.2.2.2",
+        })));
+        assert_eq!(settings.effective_current_ip(), Some("2.2.2.2"));
+    }
+
+    #[test]
+    fn the_ip_list_is_capped() {
+        let items: Vec<String> = (0..80).map(|index| format!("10.0.0.{index}")).collect();
+        let settings = pinned_upstream_from(&map_of(json!({
+            "enabled": true,
+            "ips": items,
+        })));
+        assert_eq!(settings.ips.len(), PIN_MAX_IPS);
+    }
+}

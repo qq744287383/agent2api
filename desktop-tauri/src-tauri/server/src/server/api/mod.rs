@@ -110,6 +110,10 @@ pub mod protocol;
 pub mod proxies;
 pub mod qoder_umid;
 pub mod queue_api;
+// 固定上游 IP（GET/PUT /api/pinned-upstream-ip）：provider 级的开关 / IP 列表 /
+// 超时 / 切换状态码，保存时会把该组账号的独立 IP 重置为跟随组。
+// 与 retry_api 同一模式，但它**有副作用**（会改写一批账号记录），见该文件模块头
+pub mod pinned_upstream;
 pub mod retry_api;
 // 开发者角色兼容开关（GET/PUT /api/developer-role-compat）：与 /api/sanitize
 // 同形的单开关端点，转换实施点在 `core::upstream::payload` 的 send_body，

@@ -74,6 +74,10 @@ pub fn build_daily_activity_request(
             None
         }
     };
+    let pin = crate::server::core::upstream::upstream_ip_pin::pin_for_session(
+        session,
+        proxy.is_some(),
+    );
     Ok(TransportRequest {
         url: chat_completions_url(session, Region::Intl),
         headers,
@@ -81,6 +85,9 @@ pub fn build_daily_activity_request(
         proxy,
         // 保活是转发链路的旁支，口径跟转发一致（workbuddy 不覆写能力位 = 直连）
         system_proxy_when_unset: false,
+        // 同一个域名、同一套账号，**必须**与对话链路同一口径 —— 保活若走系统
+        // DNS，用户在「固定上游 IP」里挑的线路对这一半流量就是无效的
+        pin,
     })
 }
 
@@ -150,6 +157,10 @@ pub fn build_web_conversation_request(
             None
         }
     };
+    let pin = crate::server::core::upstream::upstream_ip_pin::pin_for_session(
+        session,
+        proxy.is_some(),
+    );
     Ok(TransportRequest {
         url: web_conversations_url(session, Region::Intl),
         headers,
@@ -157,5 +168,6 @@ pub fn build_web_conversation_request(
         proxy,
         // 与桌面端保活同一口径：转发链路的旁支，workbuddy 不覆写能力位 = 直连
         system_proxy_when_unset: false,
+        pin,
     })
 }

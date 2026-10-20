@@ -41,6 +41,9 @@ async fn mock_upstream(
             proxy: None,
             // 测试替身按默认能力位（false = 直连），与生产里不带这一步的家同款
             system_proxy_when_unset: false,
+            // 固定上游 IP 在这些用例里不参与（关着的默认值即「不固定」）；
+            // 真正覆盖切换行为的用例自带构造，见本文件末尾的分组
+            pin: None,
         },
         hits,
         task,

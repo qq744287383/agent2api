@@ -274,6 +274,9 @@ pub(crate) async fn forward(
         proxy,
         // 自定义家没有能力位（用户自己配的出口就是唯一口径：配了就代理，没配就直连）
         system_proxy_when_unset: false,
+        // 固定上游 IP 只服务 WorkBuddy 国际版（见 ADR-0001 的「不覆盖」一节）：
+        // 自定义家的上游是用户自己填的域名，钉哪个地址由他配 baseUrl 决定
+        pin: None,
     };
     let response = send_chat_request(&transport)
         .await
@@ -601,6 +604,9 @@ async fn forward_translated(
         proxy,
         // 自定义家没有能力位（用户自己配的出口就是唯一口径：配了就代理，没配就直连）
         system_proxy_when_unset: false,
+        // 固定上游 IP 只服务 WorkBuddy 国际版（见 ADR-0001 的「不覆盖」一节）：
+        // 自定义家的上游是用户自己填的域名，钉哪个地址由他配 baseUrl 决定
+        pin: None,
     };
     let response = send_chat_request(&transport)
         .await

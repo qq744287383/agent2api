@@ -63,6 +63,40 @@ pub(crate) const MAX_CONCURRENT_LIMIT: u64 = 999;
 ///
 /// 单账号（`apply_patch`）与批量（`batch_update`）共用这一份：批量入口若各自
 /// 再写一遍校验，迟早漂成「设置弹窗按 999 挡、批量入口放进一个 5000」。
+/// 归一账号级固定上游 IP 补丁值。
+///
+/// - `null` / 空串 / 全空白 → `None`（= 跟随组，字段会被移除）
+/// - 其余必须是**合法 IPv4 字面量**，否则 400
+///
+/// 为什么在这里挡而不是只信界面：批量导入与 `PATCH /api/accounts/{id}` 都直接
+/// 走本函数，界面的下拉只是其中一条来源。一个不是 IPv4 的字符串进了记录，
+/// 表现是「这个账号的请求永远连不上」，而在写侧拒掉只是一次 400。
+///
+/// 与配置侧 `pin_ips_field` 的差别：那里对垃圾项**丢弃**（手改库的容错），
+/// 这里是**报错**（用户主动提交的值，应当告诉他写错了）。
+pub(crate) fn normalize_pinned_upstream_ip(
+    value: &Value,
+) -> Result<Option<String>, AccountStoreError> {
+    match value {
+        Value::Null => Ok(None),
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            if trimmed.parse::<std::net::Ipv4Addr>().is_err() {
+                return Err(AccountStoreError::bad_request(format!(
+                    "固定上游 IP 必须是 IPv4 地址：{trimmed}"
+                )));
+            }
+            Ok(Some(trimmed.to_string()))
+        }
+        _ => Err(AccountStoreError::bad_request(
+            "固定上游 IP 必须是字符串或 null",
+        )),
+    }
+}
+
 pub(crate) fn normalize_max_concurrent(value: &Value) -> Result<u64, AccountStoreError> {
     match value.as_u64() {
         Some(number) if number <= MAX_CONCURRENT_LIMIT => Ok(number),
@@ -792,6 +826,18 @@ impl AccountStore {
                     format!("代理 → {label}")
                 };
                 changes.push(label);
+            }
+        }
+
+        if let Some(value) = patch.get("pinnedUpstreamIp") {
+            let next = normalize_pinned_upstream_ip(value)?;
+            let before = record.pinned_upstream_ip();
+            if next != before {
+                record.set_pinned_upstream_ip(next.as_deref());
+                changes.push(match next {
+                    Some(ip) => format!("固定上游 IP → {ip}"),
+                    None => "固定上游 IP → 跟随组".to_string(),
+                });
             }
         }
 

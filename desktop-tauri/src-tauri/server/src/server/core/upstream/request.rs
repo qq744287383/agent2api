@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 
 use crate::server::core::egress;
 use crate::server::core::proxies::ResolvedProxy;
+use crate::server::core::upstream::upstream_ip_pin::PinTarget;
 use crate::server::errors::GatewayError;
 
 /// 单次对话请求的总超时（除退避重试外的等待时间）。
@@ -72,6 +73,12 @@ pub struct TransportRequest {
     /// 账号未配代理时本家是否**跟随系统代理**出网（编排层按适配器的能力位填，
     /// 默认 false = 直连）。为 true 的家见 `ProviderAdapter::system_proxy_when_unset`。
     pub system_proxy_when_unset: bool,
+    /// 固定上游 IP（`None` = 本次不固定，走系统 DNS）。
+    ///
+    /// 由编排层在构造时按「账号独立 IP → 组当前 IP」算好（见
+    /// `upstream_ip_pin::resolve_pin`）；**代理优先**这条判据也在那一层，
+    /// 走到这里的 `pin` 与 `proxy` 不会同时为真。
+    pub pin: Option<PinTarget>,
 }
 
 /// 归一化后的上游错误：`{code, message}`
@@ -150,10 +157,13 @@ pub async fn send_chat_request(
 ) -> Result<reqwest::Response, UpstreamRequestError> {
     // 客户端三选一：账号级代理 → 跟随系统代理（本家能力位，见
     // `TransportRequest::system_proxy_when_unset`）→ 直连
+    // 客户端三选一：账号级代理 → 跟随系统代理（本家能力位）→ 直连。
+    // 固定上游 IP 只在**没有代理**时才可能生效（见 `TransportRequest::pin`），
+    // 所以这条三分支的结构不变，只是直连那一支换成「带钉地址」的版本。
     let client = match plan.proxy.as_ref() {
         Some(proxy) => egress::client_for(Some(proxy)),
         None if plan.system_proxy_when_unset => egress::client_for_system_proxy(),
-        None => egress::client_for(None),
+        None => egress::client_for_pinned(None, plan.pin.as_ref()),
     };
     let mut builder = client.post(&plan.url).body(plan.payload.clone());
     for (key, value) in &plan.headers {

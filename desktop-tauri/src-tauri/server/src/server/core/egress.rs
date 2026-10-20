@@ -50,6 +50,7 @@ use serde_json::{json, Value};
 
 use crate::server::config::TimeoutSettings;
 use crate::server::core::proxies::ResolvedProxy;
+use crate::server::core::upstream::upstream_ip_pin::PinTarget;
 use crate::server::logging;
 
 /// 默认 User-Agent，**必须设置**。
@@ -118,7 +119,11 @@ const DIRECT_KEY: &str = "__direct__";
 /// 固定的（reqwest 没有逐请求改它们的入口），配置一改必须建新 Client ——
 /// 把值放进键里，「改设置 → 下一次取用自动命中新键 → 新客户端」就是自然结果，
 /// 旧值对应的条目由 LRU 淘汰（在途请求仍持着旧 Client 的 Arc 跑完）。
-fn cache_key(proxy: Option<&ResolvedProxy>, timeouts: &TimeoutSettings) -> String {
+fn cache_key(
+    proxy: Option<&ResolvedProxy>,
+    timeouts: &TimeoutSettings,
+    pin: Option<&PinTarget>,
+) -> String {
     let egress = match proxy {
         None => DIRECT_KEY.to_string(),
         Some(proxy) => format!(
@@ -129,11 +134,19 @@ fn cache_key(proxy: Option<&ResolvedProxy>, timeouts: &TimeoutSettings) -> Strin
         ),
     };
     // 两项传输层超时进键：见上面的说明
-    format!(
+    let base = format!(
         "{egress}|c{}|r{}",
         timeouts.connect_ms(),
         timeouts.read_timeout_backstop_ms()
-    )
+    );
+    // 固定上游 IP 也要进键：`resolve` 是**建 Client 时**生效的，两个不同 IP
+    // 的账号若共用同一个缓存键，后建的那个会顶掉先建的，于是 A 账号的请求
+    // 静默跑到 B 账号的 IP 上 —— 这类串线不报错、只在抓包时才看得见。
+    // 不带固定 IP 的调用方按键与从前逐字一致（不追加段），存量完全不受影响。
+    match pin {
+        None => base,
+        Some(pin) => format!("{base}|pin:{}", pin.cache_token()),
+    }
 }
 
 /// 构造代理 URI：`协议://[用户名[:密码]@]主机:端口`。
@@ -220,8 +233,12 @@ fn base_builder(timeouts: &TimeoutSettings) -> reqwest::ClientBuilder {
 /// 反过来，构造**直连** Client 时必须显式 `.no_proxy()`：reqwest 默认会去读
 /// 环境变量里的代理设置，不关掉的话用户机器上设了 `HTTPS_PROXY` 就会
 /// 「配置为直连却走了代理」。
-fn build_client(proxy: Option<&ResolvedProxy>, timeouts: &TimeoutSettings) -> Result<reqwest::Client, String> {
-    build_client_with(proxy, timeouts, false)
+fn build_client(
+    proxy: Option<&ResolvedProxy>,
+    timeouts: &TimeoutSettings,
+    pin: Option<&PinTarget>,
+) -> Result<reqwest::Client, String> {
+    build_client_with(proxy, timeouts, false, pin)
 }
 
 /// [`build_client`] 的本体：`no_redirect` 为真时**不自动跟随 3xx**。
@@ -235,10 +252,22 @@ fn build_client_with(
     proxy: Option<&ResolvedProxy>,
     timeouts: &TimeoutSettings,
     no_redirect: bool,
+    pin: Option<&PinTarget>,
 ) -> Result<reqwest::Client, String> {
     let mut builder = base_builder(timeouts);
     if no_redirect {
         builder = builder.redirect(reqwest::redirect::Policy::none());
+    }
+    // 固定上游 IP：把域名钉到指定地址，Host 与 TLS SNI 仍取自 URL。
+    //
+    // ── 为什么放在代理判定之前 ──────────────────────────────
+    // 它在代理分支里是**无效**的（DNS 由代理做），但这里仍然照挂 ——
+    // 真正拦住它的地方是决策层（`upstream_ip_pin::resolve_pin` 在 has_proxy
+    // 时直接给 `IgnoredByProxy`，根本不会走到这个函数）。若这里再判一次
+    // 「有代理就跳过」，两处判据迟早漂移，而漂移的表现是「日志说没生效、
+    // 实际却钉上了」这种谁也想不到的组合。
+    if let Some(pin) = pin {
+        builder = builder.resolve(pin.host, std::net::SocketAddr::new(pin.ip, 443));
     }
 
     match proxy {
@@ -300,7 +329,7 @@ fn build_system_proxy_client(timeouts: &TimeoutSettings) -> Result<reqwest::Clie
 /// 但错误会如实回到用户面前 —— 硬约束是绝不 panic（release 是 panic=abort）。
 pub fn client_without_redirects(proxy: Option<&ResolvedProxy>) -> Arc<reqwest::Client> {
     let timeouts = crate::server::config::timeout_settings();
-    match build_client_with(proxy, &timeouts, true) {
+    match build_client_with(proxy, &timeouts, true, None) {
         Ok(client) => Arc::new(client),
         Err(error) => {
             logging::log(
@@ -346,9 +375,26 @@ pub fn client_for_system_proxy() -> Arc<reqwest::Client> {
 /// 并发构造同一个出口时两次都建 Client（各自持自己的连接池），
 /// 后者覆盖前者 —— 最坏结果是多建了一个池，不影响正确性。
 pub fn client_for(proxy: Option<&ResolvedProxy>) -> Arc<reqwest::Client> {
+    client_for_pinned(proxy, None)
+}
+
+/// [`client_for`] 的带固定上游 IP 版本。
+///
+/// 不带固定 IP 时行为与 `client_for(None)` 逐字一致（缓存键也不追加段），
+/// 所以旧调用方全部可以原样留着 —— 这条兼容是刻意的：`client_for` 有约四十个
+/// 调用点，逐个改成传 `None` 只会制造一次无意义的批量 diff。
+///
+/// `pin` 与 `proxy` 同时存在时**以代理为准**（DNS 由代理做，钉地址无效）。
+/// 但这条判据的主场不在这里 —— 决策层（`upstream_ip_pin::resolve_pin`）已经
+/// 在 `has_proxy` 时给出了 `IgnoredByProxy`，正常路径根本不会带 pin 走代理。
+/// 这里不重复判定，理由见 [`build_client_with`]。
+pub fn client_for_pinned(
+    proxy: Option<&ResolvedProxy>,
+    pin: Option<&PinTarget>,
+) -> Arc<reqwest::Client> {
     // 超时设置逐次取用（配置一改，下一次就命中新键并建新 Client，见 cache_key）
     let timeouts = crate::server::config::timeout_settings();
-    let key = cache_key(proxy, &timeouts);
+    let key = cache_key(proxy, &timeouts, pin);
     // ① 先查缓存（快速路径）
     {
         let mut guard = lock_clients();
@@ -361,7 +407,7 @@ pub fn client_for(proxy: Option<&ResolvedProxy>) -> Arc<reqwest::Client> {
         }
     }
     // ② 未命中才构造（锁外，可能阻塞）
-    let client = Arc::new(build_client(proxy, &timeouts).unwrap_or_else(|error| {
+    let client = Arc::new(build_client(proxy, &timeouts, pin).unwrap_or_else(|error| {
         // 这条**保留在运行日志**（不像同类的「账号代理不可用」那样进请求日志）：
         // 它每个出口缓存条目最多触发一次 —— 构造失败的兜底 Client 也会被缓存
         // （见下面 ③），后续请求直接命中缓存、不再走到这里，所以条数**不随
