@@ -110,6 +110,9 @@
        排在最后：工具类带 !important（原因见 ui-kit/styles/globals.css 顶部），
        顺序其实已不影响结果，但保持「后加载的是更新的体系」这条阅读线索。 -->
   <link rel="stylesheet" href="islands/ui.css">
+  <!-- 原型专用样式（一次性，勿并入正式代码）：只在 prototype.js 存在时有意义。
+       见 desktop-tauri/ui-islands/src/prototype/README.md -->
+  <link rel="stylesheet" href="prototype/prototype.css">
   <!-- 多语言运行时：查表 t() + 静态文案扫描器（data-i18n 系列）。
        词典已由上面 head 里的引导脚本同步注入（document.write），这里只放运行时逻辑。
        必须排在 units.js / app.js 等业务脚本之前 —— 它们在加载期就可能读 window.wbI18n；
@@ -661,5 +664,9 @@
   <!-- 数据结构升级弹窗：启动时问一次 /api/upgrade，有待迁移数据就弹。
        排在最后：它的 refreshPanels() 要调各面板的 load()，那些都得先挂好 -->
   <script src="upgrade-panel.js"></script>
+  <!-- 原型（一次性，勿并入正式代码）：固定上游 IP 模态框的三个布局变体，
+       用 ?variant=A|B|C 切换。构建命令见 ui-islands/src/prototype/README.md。
+       找不到这个文件时浏览器只是 404 一条，不影响正式功能。 -->
+  <script src="prototype/prototype.js"></script>
 </body>
 </html>

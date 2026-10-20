@@ -12,7 +12,8 @@ desktop-tauri/src-tauri/gen/schemas/
 # 本地开发过程产物
 .zcode/
 .verify/
-prototype/
+# 只忽略仓库根的 prototype/（本地临时试验目录）；子目录里的原型要入库
+/prototype/
 # ZCode 的忽略配置文件本身（本机工具配置，不入库）
 .zcodeignore
 
@@ -58,3 +59,10 @@ desktop-tauri/mobile/android/keystore.properties
 
 # 本地测试跑出来的运行数据（数据库、加密密钥、日志）
 .agenttest2/
+
+# 原型构建产物与运行现场（一次性，见 ui-islands/src/prototype/README.md）
+desktop-tauri/ui/prototype/
+.prototype-pin/
+
+# 本地 npm 缓存（沙箱里全局缓存只读，安装时指到仓库内）
+.npm-cache/
