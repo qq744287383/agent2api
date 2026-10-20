@@ -666,3 +666,159 @@ fn a_gateway_synthesised_502_is_not_mistaken_for_an_upstream_502() {
     // 对照：上游真的回了 502 ⇒ 要切
     assert!(pin_switch_due(&status_failure(502), Some(&pin)));
 }
+
+// ── 固定上游 IP：端到端（真的打到 mock 上游上）────────────────────
+//
+// 上面那组钉的是纯判定；这一组钉的是**转发链真的按判定执行了**。
+// 为什么必须有这一层：C1 那个缺陷（「跳过同账号原地重发」没生效）恰恰是
+// 纯判定全绿、实际行为完全没变的典型 —— 判据写对了，但它被放在了
+// `send_with_retry` 之后，而那里早就把请求原地重发完了。只有数「上游被打了几次」
+// 才能发现这种事。
+
+/// 一个**延迟响应**的 mock 上游：用来触发「等待响应超时」。
+///
+/// 与 `mock_upstream` 同一手法，只多一个 sleep —— 超时判据要的是「上游迟迟不回」，
+/// 而立刻返回的替身永远走不到那条路径上。
+async fn slow_mock_upstream(
+    delay: std::time::Duration,
+) -> (
+    TransportRequest,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let count = hits.clone();
+    let app = axum::Router::new().route(
+        "/messages",
+        axum::routing::post(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            async move {
+                tokio::time::sleep(delay).await;
+                (
+                    axum::http::StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    "data: {}\n\n",
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/messages", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (
+        TransportRequest {
+            url,
+            headers: vec![("Content-Type".into(), "application/json".into())],
+            payload: r#"{"stream":true}"#.into(),
+            proxy: None,
+            system_proxy_when_unset: false,
+            pin: None,
+        },
+        hits,
+        task,
+    )
+}
+
+/// 把全局「等待响应超时」压到 1 秒（用例结束后不还原：进程级状态，
+/// 还原反而会和并行用例抢）。
+fn set_global_wait_timeout(seconds: i64) {
+    let _ = config::set_timeouts(config::TimeoutPatch {
+        connect_seconds: None,
+        headers_seconds: Some(seconds),
+        stream_idle_seconds: None,
+        body_seconds: None,
+    });
+}
+
+/// **本 issue 的核心承诺**：开了固定 IP 之后，等待响应超时**不再**在原账号上
+/// 反复重发。
+///
+/// 改前（C1）：`transport_retry_advice` 对所有传输层失败都给重发建议，于是
+/// 上游会被打 1 + 3 次（默认 retryCount=3），每次等满超时。客户端被挂住的时间
+/// 是 4 × 超时 —— 这正是 issue 开篇写的那 20 分钟。
+///
+/// 这条用例断言的是**上游只被打了一次**：判据写对但位置放错（放在
+/// `send_with_retry` 之后）时它必红。
+#[tokio::test]
+async fn a_pinned_wait_timeout_does_not_resend_on_the_same_account() {
+    let _guard = hold_pin_config();
+    set_global_wait_timeout(1);
+    // 让重试间隔为 0，免得用例真的睡 5 秒
+    let _ = config::set_retry(config::RetryPatch {
+        count: Some(3),
+        account_switch_count: Some(0),
+        interval_seconds: Some(0),
+        no_retry_codes: None,
+    });
+
+    let (mut transport, hits, task) = slow_mock_upstream(std::time::Duration::from_secs(5)).await;
+    // 钉一个地址：判据要求 pin 有值才生效。这里钉的是 mock 上游自己的地址 ——
+    // 钉的**值**不影响这条用例（请求本来就打到 127.0.0.1），要的是「pin 存在」
+    // 这个前提条件成立
+    transport.pin = Some(
+        crate::server::core::upstream::upstream_ip_pin::PinTarget::new("127.0.0.1")
+            .expect("回环地址应当合法"),
+    );
+
+    let mut budget = RetryBudget::new(3);
+    let telemetry = RequestTelemetry::new();
+    let result = send_with_retry(
+        &crate::server::core::providers::workbuddy::adapter::WORKBUDDY_INTL_ADAPTER,
+        &transport,
+        &mut budget,
+        None,
+        &telemetry,
+        false,
+    )
+    .await;
+
+    assert!(result.is_err(), "超时应当以失败收场，交给上层去切 IP");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "开了固定 IP 时，等待响应超时**不该**在同账号上重发 —— \
+         期望上游只被打 1 次，实际 {} 次（多打说明原地重发没被跳过）",
+        hits.load(Ordering::SeqCst)
+    );
+    task.abort();
+}
+
+/// 对照组：**没开**固定 IP 时，同样的一次超时照旧走原地重发。
+///
+/// 这条证明上一条的「只打一次」不是把重试逻辑整个关掉了 —— 判据只对
+/// 「已固定 IP」生效，存量行为一个字都没变。
+#[tokio::test]
+async fn an_unpinned_wait_timeout_still_resends_on_the_same_account() {
+    let _guard = hold_pin_config();
+    set_global_wait_timeout(1);
+    let _ = config::set_retry(config::RetryPatch {
+        count: Some(2),
+        account_switch_count: Some(0),
+        interval_seconds: Some(0),
+        no_retry_codes: None,
+    });
+
+    let (transport, hits, task) = slow_mock_upstream(std::time::Duration::from_secs(5)).await;
+    assert!(transport.pin.is_none(), "前提：这条用例不钉地址");
+
+    let mut budget = RetryBudget::new(2);
+    let telemetry = RequestTelemetry::new();
+    let result = send_with_retry(
+        &crate::server::core::providers::workbuddy::adapter::WORKBUDDY_INTL_ADAPTER,
+        &transport,
+        &mut budget,
+        None,
+        &telemetry,
+        false,
+    )
+    .await;
+
+    assert!(result.is_err());
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        3,
+        "没开固定 IP 时应当照旧「首发 + 2 次重发」，实际 {} 次（存量行为不该被改动）",
+        hits.load(Ordering::SeqCst)
+    );
+    task.abort();
+}
