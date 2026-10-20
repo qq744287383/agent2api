@@ -514,3 +514,140 @@ fn a_deterministic_404_skips_the_in_place_resend() {
         "404 的豁免不许顺手把 400 也豁免了"
     );
 }
+
+// ── 固定上游 IP 的切换判据（缝隙 1 的纯判定部分）──────────────────
+//
+// 这一组钉的是「什么情况下才该切 IP」。判据本身是两条纯逻辑：
+//   · `pin_switch_due`：要不要切（超时 / 命中用户填的状态码）；
+//   · `is_wait_timeout`：这次失败算不算「等太久了」。
+//
+// ── 为什么必须区分「等待响应超时」与「连接超时」────────────────
+// 传输层失败被统一收敛成 `Fatal{status:502}`（与 Node 的 fetchViaProxy 一致），
+// 于是「上游真的回了 502」与「压根没连上」在 `class` 上长得一模一样。若不区分：
+//   · 一次「连不上」会被当成「命中了用户填的 502」，多切一次 IP（IP 消耗翻倍）；
+//   · 日志里写的原因还是错的（说「状态码命中」，实际是超时）。
+// 这两条用例就是这层判据的唯一防线。
+
+/// 构造一个「传输层失败」形态的 `OutboundFailure`。
+fn transport_failure(reason: &str, timed_out: bool) -> OutboundFailure {
+    let message = format!("{reason}（直连）");
+    OutboundFailure {
+        class: UpstreamErrorClass::Fatal {
+            status: 502,
+            message: message.clone(),
+            upstream_code: None,
+        },
+        error: crate::server::errors::GatewayError::with_status(502, message),
+        timed_out,
+        // 传输层失败：压根没拿到上游响应（这正是它与「上游真回 502」的分界）
+        transport: true,
+    }
+}
+
+/// 构造一个「上游真的回了错误响应」形态的 `OutboundFailure`。
+fn status_failure(status: u16) -> OutboundFailure {
+    let message = format!("上游返回 {status}");
+    OutboundFailure {
+        class: fatal(status),
+        error: crate::server::errors::GatewayError::with_status(i32::from(status), message),
+        // 上游回了响应 ⇒ 既不是传输层超时、也不是传输层失败
+        timed_out: false,
+        transport: false,
+    }
+}
+
+/// 只有 `等待响应超时` 算「等太久了」；连接超时与连不上都不是。
+///
+/// 钉住的写歪：把判据写成 `error.is_timeout()` 或「包含『超时』二字」——
+/// 那样 `连接中超时(30秒)` 也会命中，而它说明的是「这个 IP 连不上」，
+/// 与用户填的「等多久算这条线路不行」是两件事。
+#[test]
+fn only_the_wait_for_response_timeout_counts_as_too_slow() {
+    assert!(is_wait_timeout(&super::super::request::UpstreamRequestError {
+        message: "等待响应超时(5秒，直连)".to_string(),
+        reason: "等待响应超时(5秒)".to_string(),
+    }));
+    for reason in ["连接中超时(30秒)", "上游连接失败"] {
+        assert!(
+            !is_wait_timeout(&super::super::request::UpstreamRequestError {
+                message: reason.to_string(),
+                reason: reason.to_string(),
+            }),
+            "{reason} 说明的是连不上/没连上，不该被当成「等太久」"
+        );
+    }
+}
+
+/// 没钉 IP 时一律不切：功能没开启就不该有任何行为变化。
+#[test]
+fn no_pin_means_no_switch_no_matter_what_failed() {
+    assert!(!pin_switch_due(&transport_failure("等待响应超时(5秒)", true), None));
+    assert!(!pin_switch_due(&status_failure(502), None));
+}
+
+/// 超时命中就切，**不需要**用户填的状态码配合。
+#[test]
+fn a_wait_timeout_switches_even_when_the_status_list_is_empty() {
+    let pin = upstream_ip_pin::PinTarget::new("1.2.3.4").expect("测试地址应当合法");
+    // 状态码名单为空（用户显式保存过空数组）：只按超时判
+    let _ = config::set_pinned_upstream(config::PinnedUpstreamPatch {
+        enabled: Some(true),
+        ips: Some(vec!["1.2.3.4".into(), "5.6.7.8".into()]),
+        status_codes: Some(vec![]),
+        wait_timeout_seconds: Some(5),
+        current_ip: None,
+    });
+    assert!(
+        pin_switch_due(&transport_failure("等待响应超时(5秒)", true), Some(&pin)),
+        "超时是独立判据，不该依赖状态码名单"
+    );
+}
+
+/// 状态码命中就切；没命中就不切（这条是「不要见错就切」的对照组）。
+#[test]
+fn a_listed_status_code_switches_and_an_unlisted_one_does_not() {
+    let pin = upstream_ip_pin::PinTarget::new("1.2.3.4").expect("测试地址应当合法");
+    let _ = config::set_pinned_upstream(config::PinnedUpstreamPatch {
+        enabled: Some(true),
+        ips: Some(vec!["1.2.3.4".into(), "5.6.7.8".into()]),
+        status_codes: Some(vec![502, 504]),
+        wait_timeout_seconds: Some(0),
+        current_ip: None,
+    });
+    assert!(pin_switch_due(&status_failure(502), Some(&pin)), "502 在名单里");
+    assert!(pin_switch_due(&status_failure(504), Some(&pin)), "504 在名单里");
+    assert!(
+        !pin_switch_due(&status_failure(500), Some(&pin)),
+        "500 不在名单里 —— 它该继续走既有的原地重发 / 换号，而不是切 IP"
+    );
+}
+
+/// **最关键的一条**：网关自己合成的 502（连不上 / 连接超时）不能被当成
+/// 「命中了用户填的 502」。
+///
+/// 两种失败在 `class` 上完全同形（都是 `Fatal{status:502}`），唯一的区别是
+/// `timed_out` 与 `error.message` 的来源。用户几乎一定会把 502 留在名单里
+/// （那是默认值），所以这条判据错了，等于**每次连不上都白切一个 IP**。
+#[test]
+fn a_gateway_synthesised_502_is_not_mistaken_for_an_upstream_502() {
+    let pin = upstream_ip_pin::PinTarget::new("1.2.3.4").expect("测试地址应当合法");
+    let _ = config::set_pinned_upstream(config::PinnedUpstreamPatch {
+        enabled: Some(true),
+        ips: Some(vec!["1.2.3.4".into(), "5.6.7.8".into()]),
+        status_codes: Some(vec![502]),
+        wait_timeout_seconds: Some(0),
+        current_ip: None,
+    });
+    // 连不上：status 也是 502，但 timed_out = false，且它不是「上游返回的」
+    let unreachable = transport_failure("上游连接失败", false);
+    assert_eq!(
+        unreachable.error.status_code, 502,
+        "前提：传输层失败确实被收敛成 502（这条用例的意义就在这个巧合上）"
+    );
+    assert!(
+        !pin_switch_due(&unreachable, Some(&pin)),
+        "连不上不是「上游返回 502」，不该按状态码判据切 IP"
+    );
+    // 对照：上游真的回了 502 ⇒ 要切
+    assert!(pin_switch_due(&status_failure(502), Some(&pin)));
+}

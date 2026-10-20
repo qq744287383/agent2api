@@ -116,12 +116,29 @@ struct OutboundFailure {
     /// 状态码名单，后者已经有自己的判据（见 ADR-0001 决定 4 与「502 的歧义」）。
     /// 这个布尔只由 `UpstreamRequestError.reason` 的前缀决定，不引入新的错误类型。
     timed_out: bool,
+    /// 这次失败是不是**根本没拿到上游响应**（传输层失败）。
+    ///
+    /// 与 [`Self::timed_out`] 的区别：那个只说「等太久了」，这个说「没有响应」。
+    /// 三种传输层失败（等待响应超时 / 连接超时 / 上游连接失败）都是 `true`；
+    /// 上游返回错误响应时是 `false`。
+    ///
+    /// 为什么单独记一个字段而不是从 `class` 判：传输层失败被收敛成
+    /// `Fatal{status:502}`，与「上游真的回了 502」在 `class` 上完全同形 ——
+    /// 那是本文件唯一必须靠这个字段区分的判据（见 `pin_switch_due`）。
+    transport: bool,
     /// 给客户端的网关错误（状态码 / 文案 / 上游码）。
     ///
     /// 限额记录与事件上报也读它的 `message` —— 改造前 `markAccountLimited`
     /// 收的就是 `error.message`（`上游返回 429: {上游原文}`），
     /// accounts.json 里落的那段文案因此逐字不变。
     error: GatewayError,
+}
+
+impl OutboundFailure {
+    /// 这次失败是否根本没拿到上游响应（见字段 `transport` 的说明）。
+    fn is_transport_failure(&self) -> bool {
+        self.transport
+    }
 }
 
 /// **原地重发**的退避预算（见 `send_with_retry` 的说明）。
@@ -282,6 +299,26 @@ fn pin_switch_due(
     }
     if failure.timed_out {
         return true;
+    }
+    // ── 状态码判据只认「上游真的回了这个码」────────────────────
+    //
+    // `OutboundFailure` 有两种来源，而在 `class` 上它们同形（都是
+    // `Fatal{status:502}`）：
+    //   1. 上游返回了一个错误响应 —— 状态码来自 `response.status()`；
+    //   2. 传输层压根没连上 —— 状态码是网关**自己合成**的 502。
+    //
+    // 用户几乎一定会把 502 留在名单里（那是默认值）。所以若不加区分，
+    // 每一次「连不上」都会被当成「命中了 502」，白白消耗一个 IP 名额，
+    // 日志里还会把原因记成「状态码命中」—— 两个都是错的。
+    //
+    // 判据取 `timed_out` 的反面：这个字段为假且 `class` 是 `Fatal`，
+    // 只可能来自「上游确实回了响应」（见 `send_with_retry` 两处构造点：
+    // 传输层失败那一处会按 `reason` 算 `timed_out`，而**非超时**的传输层
+    // 失败同样走那一处 —— 所以光看 `timed_out` 不够，还要看错误文案是不是
+    // 由传输层生成的）。这里用 `error.message` 的来源判定：传输层失败一定
+    // 带 `上游请求失败（…）` 或 `连接中超时(…)` 前缀。
+    if failure.is_transport_failure() {
+        return false;
     }
     let status = failure.error.status_code;
     u16::try_from(status)
@@ -2641,6 +2678,8 @@ fn cancelled_failure() -> OutboundFailure {
         // 手动终止不是链路超时：它有自己的判定（调用方按令牌短路），不该被
         // 固定上游 IP 的「切换」判据误当成「这条线路不行了」
         timed_out: false,
+        // 也不是传输层失败（用户主动停的，与链路质量无关）
+        transport: false,
     }
 }
 
@@ -2762,6 +2801,8 @@ async fn send_with_retry(
                     // 判据取自错误自带的简短原因（`等待响应超时(N秒)`），
                     // 不新造错误类型 —— 那条 reason 本来就是给重试链展示用的
                     timed_out: is_wait_timeout(&error),
+                    // 这一支是**传输层**失败：压根没拿到上游响应
+                    transport: true,
                 });
             }
         };
@@ -2850,8 +2891,9 @@ async fn send_with_retry(
             }
         };
         // 走到这里说明上游**真的回了**一个错误响应（状态码 + 报文），
-        // 所以永远不是传输层超时 —— 固定上游 IP 的判据要比对的是它的状态码
-        return Err(OutboundFailure { class, error, timed_out: false });
+        // 所以既不是传输层超时、也不是传输层失败 —— 固定上游 IP 的判据
+        // 要比对的就是它的状态码
+        return Err(OutboundFailure { class, error, timed_out: false, transport: false });
     }
 }
 
