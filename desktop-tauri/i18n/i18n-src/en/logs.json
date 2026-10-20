@@ -14,6 +14,7 @@
   "复制当前筛选结果": "",
   "导出": "Export",
   "已复制 {n} 条日志": "",
+  "异常响应状态码 {code}": "Error response status code {code}",
   "按分类筛选": "Filter by category",
   "按最低级别筛选": "Filter by minimum level",
   "搜索关键字": "",
@@ -31,9 +32,12 @@
   "确定清空<strong>全部</strong>运行日志？清空后无法恢复。": "Clear <strong>all</strong> runtime logs? This cannot be undone.",
   "确定清空当前筛选出的 <strong>{count}</strong> 条日志？清空后无法恢复。": "Clear the <strong>{count}</strong> filtered log entries? This cannot be undone.",
   "系统事件": "System events",
+  "组策略": "Group policy",
   "警告": "Warning",
   "读取日志失败": "",
   "调试": "Debug",
+  "账号策略": "Account policy",
+  "走出网代理，固定上游 IP 不生效": "Goes through an egress proxy; pinned upstream IP has no effect",
   "运行日志已清空": "Runtime logs cleared",
   "错误": "Error"
 }

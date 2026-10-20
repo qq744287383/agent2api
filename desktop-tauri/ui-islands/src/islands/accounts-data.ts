@@ -351,6 +351,31 @@ export function refreshCaches(validIds: Set<string>): void {
   const selected = new Set(getStore().selected)
   for (const id of [...selected]) if (!validIds.has(id)) { selected.delete(id); touched = true }
   if (touched) patch({ panels, connections, usageInflight: inflight, selected })
+  // 固定上游 IP 的开关状态决定「上游 IP」整列出不出现。每次刷新读一次
+  // （app.js 每 20 秒一轮）：改完开关不必重开面板，下一轮就跟着变。
+  void syncUpstreamIpColumn()
+}
+
+/**
+ * 把「上游 IP 列该不该出现」同步进 store。
+ *
+ * 判据是后端那份配置的 `enabled && ips.length > 0` —— 与 `UpstreamIpCell`
+ * 判断单元格要不要渲染的口径**必须一致**，否则会出现「表头在、格子在」或
+ * 「表头没了、格子还在」两种错位。
+ *
+ * 读失败（网关没起来 / 桥没注入）时按「不显示」处理：宁可少一列，也不要在
+ * 一个读不到配置的环境里给每个 provider 都挂一条空列。
+ */
+async function syncUpstreamIpColumn(): Promise<void> {
+  let visible = false
+  try {
+    const response = await shared().workbuddyDesktop?.getPinnedUpstream?.()
+    const settings = response?.pinnedUpstreamIp
+    visible = Boolean(settings?.enabled && (settings.ips?.length ?? 0) > 0)
+  } catch {
+    visible = false
+  }
+  if (getStore().upstreamIpVisible !== visible) patch({ upstreamIpVisible: visible })
 }
 
 /* ─── 连接数（实时，2 秒一轮）────────────────────

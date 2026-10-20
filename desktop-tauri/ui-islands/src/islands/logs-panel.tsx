@@ -60,7 +60,21 @@ import { t } from '../i18n'
  */
 type LogEntry = {
   id?: number; ts?: number; level?: string; category?: string; message?: string
-  data?: { from?: string; to?: string; model?: string; resetAtText?: string; status?: string | number } | null
+  data?: {
+    /** 429 换号：账号名 */
+    from?: string; to?: string
+    model?: string; resetAtText?: string; status?: string | number
+    /** 固定上游 IP 切换（见 api/pinned_upstream 与 provider_loop 的 note_ip_switch）：
+     *  与上面那对是**不同的键**——`from`/`to` 是账号，`fromIp`/`toIp` 是地址，
+     *  同一条记录里两对都有。 */
+    kind?: string
+    fromIp?: string; toIp?: string
+    fromAccount?: string; toAccount?: string
+    reason?: string
+    attempt?: number
+    scope?: string
+    provider?: string
+  } | null
 }
 
 /** GET /api/logs 的响应：后端另附 levels / categories / max 三个字典字段 */
@@ -338,6 +352,36 @@ function extraText(entry: LogEntry): string {
   const data = entry.data
   if (!data) return ''
   const parts: string[] = []
+
+  // ── 固定上游 IP 的切换（kind = upstream_ip_switch）─────────────
+  // 与 429 换号是**两条不同的记录**，字段也不同：那条讲账号，这条讲地址。
+  // 一条切换记录里同时有两者，所以这里先渲染 IP、再补账号，用户一眼能看出
+  // 「换了哪条线路、换到了哪个账号」。
+  if (data.kind === 'upstream_ip_switch') {
+    if (data.fromIp || data.toIp) {
+      parts.push([data.fromIp, data.toIp].filter(Boolean).join(' → '))
+    }
+    if (data.reason === 'timeout') parts.push(t('等待响应超时'))
+    else if (data.reason === 'status' && data.status != null) {
+      parts.push(t('异常响应状态码 {code}', { code: String(data.status) }))
+    }
+    if (data.fromAccount || data.toAccount) {
+      parts.push([data.fromAccount, data.toAccount].filter(Boolean).join(' → '))
+    }
+    if (data.scope) {
+      parts.push(data.scope === 'account' ? t('账号策略') : t('组策略'))
+    }
+    return parts.join(' · ')
+  }
+
+  // ── 固定上游 IP 因代理未生效（kind = upstream_ip_pin_ignored）──
+  if (data.kind === 'upstream_ip_pin_ignored') {
+    parts.push(t('走出网代理，固定上游 IP 不生效'))
+    if (data.provider) parts.push(data.provider)
+    return parts.join(' · ')
+  }
+
+  // ── 既有的 429 换号 / 目录刷新 / 限流 ──────────────────────────
   if (data.from || data.to) parts.push([data.from, data.to].filter(Boolean).join(' → '))
   if (data.model) parts.push(t('模型 {model}', { model: data.model }))
   if (data.resetAtText) parts.push(t('{time} 恢复', { time: data.resetAtText }))

@@ -1347,6 +1347,10 @@ export function UpstreamIpCell({ account }: { account: AccountRecord }) {
 
   React.useEffect(() => { void load() }, [load])
 
+  // 列本身的显隐由 `visibleColumns()` 按 store 里的开关状态统一管（整列消失，
+  // 含表头与列宽）。这里只兜「列可见但这一个账号不该有内容」：
+  //   · 不是 WorkBuddy 国际版 —— 别的家没有这个概念；
+  //   · 状态还没读到 / 组里一个 IP 都没有 —— 画一个空下拉只会让人点进去发现没东西。
   if (providerOf(account) !== 'workbuddy-intl') return null
   if (!state?.enabled || state.ips.length === 0) return null
 

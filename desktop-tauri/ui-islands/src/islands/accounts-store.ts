@@ -54,6 +54,16 @@ export type AccountsStore = {
   namesHidden: boolean
   /** 批量查询余额在途（工具条按钮的文案与禁用态） */
   usageBusy: boolean
+  /**
+   * 「上游 IP」这一列该不该出现。
+   *
+   * 判据是**固定上游 IP 开关开着且列表非空** —— 关掉时整列（含表头）一起消失，
+   * 而不是留一条 148px 的空列（用户故事 34：关掉时相关元素一起消失）。
+   *
+   * 为什么放在 store 而不是每个单元格各问一次：表格一次渲染要问 25 次以上，
+   * 而这份状态在一次渲染里不会变。由账号页在拿到快照时写入。
+   */
+  upstreamIpVisible: boolean
   /** 余额查询在途的账号（行上那颗「余额」按钮的去重闸） */
   usageInflight: ReadonlySet<string>
 }
@@ -119,6 +129,7 @@ let store: AccountsStore = {
   dialog: null,
   namesHidden: loadNamesHidden(),
   usageBusy: false,
+  upstreamIpVisible: false,
   usageInflight: new Set<string>(),
 }
 

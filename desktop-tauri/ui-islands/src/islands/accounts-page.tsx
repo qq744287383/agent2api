@@ -106,7 +106,12 @@ let headSignature = ''
 
 /** 当前可见列（顺序即配置顺序；列设置未就绪时退回全部列） */
 function visibleColumns(): Array<(typeof ACCOUNT_COLUMNS)[number] & { align: 'left' | 'center' | 'right' }> {
-  return colHandle ? colHandle.apply(ACCOUNT_COLUMNS) : ACCOUNT_COLUMNS
+  const columns = colHandle ? colHandle.apply(ACCOUNT_COLUMNS) : ACCOUNT_COLUMNS
+  // 「上游 IP」整列随开关一起消失（用户故事 34）。过滤放在这里而不是让
+  // 单元格各自返回 null：那样表头与 colgroup 还在，表格里会留一条空列，
+  // 列宽预算也多算 148px。
+  if (getStore().upstreamIpVisible) return columns
+  return columns.filter(column => column.key !== 'upstreamIp')
 }
 
 /** 触发一次重绘（store 换快照 → 订阅者重画） */
@@ -123,10 +128,14 @@ function requestRender(): void {
  */
 function syncHead(): void {
   const columns = visibleColumns()
-  const signature = `${tableEl ? 'T' : 'F'}|${columns.map(column => `${column.key}:${column.align}`).join('|')}`
+  const signature = `${tableEl ? 'T' : 'F'}|up:${getStore().upstreamIpVisible ? 1 : 0}|${columns.map(column => `${column.key}:${column.align}`).join('|')}`
   if (signature === headSignature) return
   headSignature = signature
-  shared().wbColSettings?.syncStaticHead('accounts', tableEl)
+  // 「上游 IP」不是用户配置里的显隐，而是**运行时能力**：开关关着时这一列
+  // 根本不存在。`viewHidden` 正是为这种「与用户配置正交的临时隐藏」准备的，
+  // 它能同时摘掉 <th> 与 <col>（列设置里的勾选状态不受影响）。
+  const viewHidden = getStore().upstreamIpVisible ? null : new Set(['upstreamIp'])
+  shared().wbColSettings?.syncStaticHead('accounts', tableEl, viewHidden)
   // 把手要放在「不是最后一列」的格子上：它绝对定位在右缘（right: -4px），钉在表格
   // 右缘会顶出一条横向滚动条。「哪一列在最后」是用户配置出来的，所以按渲染后的位置判。
   const ths = [...(tableEl?.querySelectorAll('thead th') || [])]

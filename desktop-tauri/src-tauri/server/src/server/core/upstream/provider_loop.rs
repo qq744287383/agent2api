@@ -280,6 +280,12 @@ struct PinSwitch {
     to_account: String,
     reason: &'static str,
     status: Option<i64>,
+    /// 这次切换是「组策略」还是「账号策略」驱动的。
+    ///
+    /// 两者对用户的含义完全不同：组策略改的是这一组共用的当前 IP，账号策略
+    /// 改的是**这一个账号**的绑定。排查「为什么别的账号也跟着变了」时，第一眼
+    /// 要看的就是这个字段（见 GLOSSARY 的「组策略 / 账号策略」）。
+    scope: &'static str,
 }
 
 /// 这一次失败要不要触发固定上游 IP 的切换。
@@ -416,6 +422,7 @@ fn advance_pin_and_switch(
         to_account,
         reason,
         status: if failure.timed_out { None } else { Some(i64::from(failure.error.status_code)) },
+        scope: if account_scoped { "account" } else { "group" },
     })
 }
 
@@ -455,22 +462,26 @@ fn advance_account_pin(
 fn note_ip_switch(
     telemetry: &crate::server::core::upstream::usage::RequestTelemetry,
     switch: &PinSwitch,
-    failure: &OutboundFailure,
+    provider: &str,
 ) {
+    // 这是本次请求里的第几轮尝试（1 起）。spec 要求日志带「切换序号」——
+    // 它让「这次请求一共换了几次」可以直接从日志里数出来，不必去对别的列。
     let attempt = telemetry.snapshot().attempts.max(1);
-    let _ = (failure, attempt);
     logging::log_event(
         "warn",
         "upstream",
         &switch.note,
         Some(serde_json::json!({
             "kind": "upstream_ip_switch",
+            "attempt": attempt,
             "reason": switch.reason,
             "status": switch.status,
             "fromIp": switch.from_ip,
             "toIp": switch.to_ip,
             "fromAccount": switch.from_account,
             "toAccount": switch.to_account,
+            "scope": switch.scope,
+            "provider": provider,
         })),
     );
 }
@@ -1622,7 +1633,7 @@ async fn attempt_queue(
                             // 切 IP 与换号是同一次动作（ADR-0001 决定 4）：
                             // 记录里要能同时看到 IP 与账号各自的 from/to
                             ctx.telemetry.note_attempt_retry(&switch.note, None, 0);
-                            note_ip_switch(ctx.telemetry, &switch, &failure);
+                            note_ip_switch(ctx.telemetry, &switch, provider_id);
                             continue 'accounts;
                         }
                     }
