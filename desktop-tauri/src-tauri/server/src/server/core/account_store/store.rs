@@ -538,6 +538,19 @@ impl AccountStore {
                 "enterpriseName": record.enterprise_name(),
             },
         });
+        // ── 固定上游 IP（所有家通用的账号属性）──────────────────────
+        // 与下面 ZCode / Antigravity 的附加键同一手法，但**不按家过滤**：
+        // 这个字段只在 WorkBuddy 国际版上被读（配置与 IP 列表都是 provider 级的），
+        // 别家带着它也只是多一个没人读的键。
+        //
+        // 为什么必须在这里注入：目录 / 余额 / 凭证续期 / 保活四条旁支手上只有
+        // session（`pin_for_session` 从它里读），而账号记录本身不在这层。
+        // 少了这一步，那几条路径的「账号策略」会静默退化成「跟随组」。
+        if let Some(ip) = record.pinned_upstream_ip() {
+            if let Some(object) = session.as_object_mut() {
+                object.insert("pinnedUpstreamIp".to_string(), Value::String(ip));
+            }
+        }
         if crate::server::core::providers::zcode::region::Region::from_provider_id(
             &record.provider(),
         )

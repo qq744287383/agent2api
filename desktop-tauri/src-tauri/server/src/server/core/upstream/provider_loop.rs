@@ -563,8 +563,25 @@ fn transient_retry_advice(status: u16, remaining: usize) -> Option<RetryAdvice> 
 ///
 /// 原因取错误自带的简短形态（`UpstreamRequestError::reason`）：连接超时与
 /// 等待响应头超时各自带设置页旋钮名与实际秒数，其余统一「上游连接失败」。
-fn transport_retry_advice(error: &super::request::UpstreamRequestError, remaining: usize) -> Option<RetryAdvice> {
+fn transport_retry_advice(
+    error: &super::request::UpstreamRequestError,
+    remaining: usize,
+    pinned: bool,
+) -> Option<RetryAdvice> {
     if remaining == 0 {
+        return None;
+    }
+    // ── 固定上游 IP 时，「等待响应超时」不在同账号原地重发 ────────────
+    //
+    // 这是本功能的**核心承诺**（issue #14 的 Problem Statement 就在讲这个）：
+    // 原来一次 300 秒超时会先在同一账号上重发 3 次、每次重新等满，最坏把客户端
+    // 挂住 20 分钟才换人。开了固定 IP 之后，超时已经是「这条线路不行」的强信号，
+    // 原地重发不引入任何新变量。
+    //
+    // 判据只收 `等待响应超时`：连接超时 / 连不上说明这个 IP 根本到不了，同样
+    // 该切，但它们本来就很快返回（30 秒），不构成「被反复挂满」的问题 ——
+    // 留给上层的动作 0.5 一并处理（那里对两者都会切）。
+    if pinned && is_wait_timeout(error) {
         return None;
     }
     Some(RetryAdvice {
@@ -2779,7 +2796,9 @@ async fn send_with_retry(
                 }
                 // 传输层失败（DNS/代理/连接）：按设置退避重发，吸收链路抖动；
                 // 次数用完才收敛成 502，与改造前的兜底一致
-                if let Some(advice) = transport_retry_advice(&error, budget.remaining) {
+                if let Some(advice) =
+                    transport_retry_advice(&error, budget.remaining, transport.pin.is_some())
+                {
                     budget.remaining -= 1;
                     let used = budget.used();
                     telemetry.note_attempt_retry(&advice.reason, None, advice.delay_ms);

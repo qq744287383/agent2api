@@ -50,8 +50,26 @@ pub const NO_TOTAL_TIMEOUT: Option<u64> = None;
 /// `UpstreamService::forward` 的说明），响应头在 SSE 建立时就到达，
 /// 与「模型思考多久」无关；非流式的长回答也走这条路径（本地聚合）。
 /// 超时按传输层失败处理（502 + 既有退避重试），与连接失败同一档。
-fn headers_timeout() -> Duration {
-    Duration::from_millis(crate::server::config::timeout_settings().headers_ms())
+/// 这一次请求实际生效的等待响应超时。
+///
+/// ── 为什么固定上游 IP 要单独压一个上限 ──────────────────────
+/// 用户开了固定 IP 之后可以在弹窗里填「等待响应超时」（秒）——语义是**这条线路
+/// 多久不回就算不行**。不压这一刀，那个输入框就是个纯装饰：真正生效的只有全局
+/// 那 300 秒，用户填 5 秒也不会有任何变化。
+///
+/// 取两者**较小者**（见 `PinnedUpstreamSettings::effective_wait_timeout_seconds`）：
+/// 用户填 0 = 跟随全局；填得比全局大 = 按全局（「只能比全局更严」这条决定因此
+/// 在行为上成立，而不是靠写入侧报错）。
+fn wait_timeout_for(pin: Option<&PinTarget>) -> Duration {
+    let global = crate::server::config::timeout_settings().headers_seconds;
+    match pin {
+        None => Duration::from_millis(crate::server::config::timeout_settings().headers_ms()),
+        Some(_) => {
+            let settings = crate::server::config::pinned_upstream_settings();
+            let seconds = settings.effective_wait_timeout_seconds(global);
+            Duration::from_secs(seconds.max(1) as u64)
+        }
+    }
 }
 
 /// 「连接中超时」的设定值（秒）：连接超时文案标注实际生效的秒数用，
@@ -184,7 +202,7 @@ pub async fn send_chat_request(
     };
     // 等待响应头有上限（见 headers_timeout 的说明）：超时后 future 被丢弃，
     // 上游连接随之关闭（与客户端断开时的取消是同一机制）
-    let headers_budget = headers_timeout();
+    let headers_budget = wait_timeout_for(plan.pin.as_ref());
     match tokio::time::timeout(headers_budget, builder.send()).await {
         Ok(Ok(response)) => Ok(response),
         Ok(Err(error)) => {
