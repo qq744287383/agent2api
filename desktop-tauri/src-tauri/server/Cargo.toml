@@ -1,6 +1,6 @@
 [package]
 name = "agent2api-server"
-version = "3.1.0"
+version = "3.1.1-beta.1"
 description = "Agent2API 网关本体 — 多提供商本地网关（桌面端与 headless 服务器共用）"
 authors = ["Agent2API"]
 edition = "2021"
