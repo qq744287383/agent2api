@@ -822,3 +822,253 @@ async fn an_unpinned_wait_timeout_still_resends_on_the_same_account() {
     );
     task.abort();
 }
+
+// ── 固定上游 IP：**账号循环**这一层的端到端 ──────────────────────────
+//
+// 上面那两条 E2E 钉的是「一次发送里重发了几次」（`send_with_retry` 那一层）；
+// 这一组再往上走一层，钉的是**只有账号循环才有的两件事**：
+//
+//   · 换号预算（`switches_left`）耗尽之后，客户端拿到的是**最后一次**上游错误；
+//   · IP 列表转满一圈之后回到头部（列表是候选集，不是一次性消耗品）。
+//
+// 为什么这两条必须端到端：两者都是「编排层的记账」而不是「某一处的判据」。
+// `take_switch` 单看是个三行函数，`IpCursor::next` 单看是取模 —— 真正决定
+// 行为的是它们在 `attempt_queue` 里的调用位置与顺序（先问有没有下一个账号、
+// 再扣预算；切 IP 与换号是同一次动作）。把这两个函数单独测一遍，等于只测了
+// 「取模算得对」，测不到「预算真的拦住了第 3 个账号」「游标真的转回了第 1 个
+// IP」。C1 那个缺陷就是纯判定全绿、实际行为没变的教训（见文件头）。
+
+/// 每次被打都记一笔、并把**这是第几次**写进错误文案的 mock 上游。
+///
+/// 文案必须逐次不同：「预算耗尽返回最后一次错误」这条断言靠它区分
+/// 「返回了最后一次」与「返回了第一次」—— 若每次都回同一句 502，
+/// 两种结论在外部完全同形，用例就钉不住任何东西。
+async fn counting_error_mock(
+    status: u16,
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = hits.clone();
+    let app = axum::Router::new().route(
+        // workbuddy 的对话端点：`{endpoint}/v2/chat/completions`
+        "/v2/chat/completions",
+        axum::routing::post(move || {
+            let nth = counter.fetch_add(1, Ordering::SeqCst) + 1;
+            async move {
+                (
+                    axum::http::StatusCode::from_u16(status)
+                        .expect("用例里的状态码应当是合法的"),
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    format!(r#"{{"code":null,"message":"hit-{nth}"}}"#),
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("mock 监听");
+    let endpoint = format!("http://{}", listener.local_addr().expect("本地地址"));
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.expect("mock 服务") });
+    (endpoint, hits, task)
+}
+
+/// 一份临时库 + `count` 个 workbuddy-intl 账号，全部指到同一个 mock 上游。
+///
+/// 账号级的 `endpoint` 覆盖是**生产能力**（staging / 自建反向代理用户的落点，
+/// 见 `chat_completions_url`），这里借同一条路把请求指到 mock 上 —— 不是给
+/// 测试专门开的后门。`expiresAt` 放到一天后：临期会触发 `ensure_access_token`
+/// 的主动刷新，那条支路会真打一遍上游，把「打了几次」的计数搅乱。
+fn service_with_accounts(endpoint: &str, count: usize) -> (TempDbDir, UpstreamService) {
+    use crate::server::core::account_store::AccountStore;
+    use crate::server::core::auth::AuthService;
+    use crate::server::db::Db;
+
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("pl-pin-loop-{}-{seq}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store =
+        AccountStore::with_db(Some(Db::open(&dir.join("agent2api.db")).expect("临时库应当能建起来")));
+    for index in 0..count {
+        store
+            .add_account(
+                &json!({
+                    "auth": {
+                        "accessToken": format!("at-{index}"),
+                        "expiresAt": logging::now_ms() as f64 + 86_400_000.0,
+                    },
+                    "account": { "uid": format!("pin-loop-{index}") },
+                    "endpoint": endpoint,
+                }),
+                None,
+                Some("workbuddy-intl"),
+            )
+            .expect("临时账号应当能建起来");
+    }
+    let service = UpstreamService::new(store.clone(), AuthService::for_store(store));
+    (TempDbDir(dir), service)
+}
+
+/// 把**完整的账号循环**跑一遍：选路 → 适配器构请求 → 真打 mock → 分类 →
+/// 按判据切 IP / 换号。返回结果与本次的记账快照（切换记录从后者读）。
+///
+/// 直接调 `attempt_queue`（而不是 `forward`）是为了跳过按模型名的候选链计算：
+/// 这里要钉的是「循环怎么走」，不是「哪些家被选中」——后者有自己的用例。
+async fn run_account_loop(
+    service: &UpstreamService,
+    body: &Value,
+) -> (
+    Result<ForwardOutcome, GatewayError>,
+    crate::server::core::upstream::usage::TelemetrySnapshot,
+) {
+    let config_snapshot = config::current();
+    let headers = axum::http::HeaderMap::new();
+    let telemetry = Arc::new(RequestTelemetry::new());
+    let ctx = ProviderContext {
+        body,
+        stream: false,
+        client_headers: &headers,
+        telemetry: &telemetry,
+        sanitize_fingerprints: false,
+        developer_role_compat: false,
+        prompt: config_snapshot.prompt_plan(),
+        key_scope: None,
+        pinned_account: None,
+        ignore_model_gate: false,
+        proxy_override: None,
+    };
+    let mut slot: Option<InFlightGuard> = None;
+    let mut connections = ConnectionGuard::new(service.connections());
+    let result =
+        attempt_queue(service, &ctx, &["workbuddy-intl"], &mut slot, &mut connections).await;
+    (result, telemetry.snapshot())
+}
+
+/// 一份最小可发送的对话体（mock 不看内容，adapter 的归一会读 messages）。
+fn chat_body() -> Value {
+    json!({
+        "model": "claude-sonnet-4-5-20250929",
+        "messages": [{ "role": "user", "content": "hi" }],
+        "stream": true,
+    })
+}
+
+/// **换号预算耗尽后，交回客户端的是最后一次上游错误。**
+///
+/// 这条钉的是 `take_switch` 的**位置**：它在「问过有没有下一个账号」之后才扣。
+/// 写反了（先扣再问）会让「队列里最后一个账号失败」也白吃一个额度；而把预算
+/// 判断漏掉则会让第 3 个账号也被顺延 —— 用户填的「切换账号重试次数」形同虚设。
+///
+/// 断言用**逐次不同的文案**（`hit-1` / `hit-2`）把「最后一次」钉死：错误文案
+/// 里必须是 `hit-2`，不能是 `hit-1`，也不能是网关自己拼的文案。
+#[tokio::test]
+async fn a_spent_switch_budget_hands_back_the_last_upstream_error() {
+    let _guard = hold_pin_config();
+    let _ = config::set_retry(config::RetryPatch {
+        // 不做同账号原地重发：一次失败 = 一次上游往返，命中次数才读得成
+        // 「试了几个账号」
+        count: Some(0),
+        // 只准换一次号：首发 + 1 次换号 = 2 个账号；第 3 个账号明明还在队列里
+        account_switch_count: Some(1),
+        interval_seconds: Some(0),
+        no_retry_codes: Some(Vec::new()),
+    });
+    let _ = config::set_pinned_upstream(config::PinnedUpstreamPatch {
+        enabled: Some(true),
+        ips: Some(vec!["1.1.1.1".into(), "2.2.2.2".into()]),
+        status_codes: Some(vec![502]),
+        wait_timeout_seconds: Some(0),
+        current_ip: Some("1.1.1.1".into()),
+    });
+
+    let (endpoint, hits, task) = counting_error_mock(502).await;
+    let (_dir, service) = service_with_accounts(&endpoint, 3);
+    let (result, _snapshot) = run_account_loop(&service, &chat_body()).await;
+    task.abort();
+
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("上游每次都回 502，这次请求不可能成功"),
+    };
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "换号预算 1 ⇒ 首发 + 1 次换号，应当只打到 2 个账号，实际 {} 次",
+        hits.load(Ordering::SeqCst)
+    );
+    assert_eq!(error.status_code, 502);
+    assert!(
+        error.message.contains("hit-2"),
+        "预算耗尽时必须交回**最后一次**上游错误（hit-2），实际：{}",
+        error.message
+    );
+    assert!(
+        !error.message.contains("hit-1"),
+        "…而且不能是第一次那句（两条文案逐次不同，正是为了能分辨这件事）：{}",
+        error.message
+    );
+    assert_eq!(
+        config::pinned_upstream_settings().current_ip,
+        "2.2.2.2",
+        "换了一次号 ⇒ 组当前 IP 前进一格"
+    );
+}
+
+/// **组策略的 IP 游标转满一圈回到头部。**
+///
+/// 列表只有两个 IP、三个账号、换号预算 2：第一次切换 1.1.1.1 → 2.2.2.2，
+/// 第二次必须**回到 1.1.1.1**（列表是候选集，不是一次性消耗品，见 ADR-0001
+/// 决定 5）。若把 `next()` 写成「到末尾就停」，第二次切换会拿到空串 ——
+/// 用户会看到一条「换成 」（空）的日志，而实际上那条线路根本没换。
+///
+/// 断言读的是**每轮尝试的切换记录**（`attempts_detail[].retries`，与用户在
+/// 请求日志里看到的同一份数据），不是终态配置：终态的 `currentIp` 只能证明
+/// 「最后停在第一个」，证明不了中间真的从第二个跳回来过。
+#[tokio::test]
+async fn the_group_ip_cursor_wraps_back_to_the_head_after_a_full_lap() {
+    let _guard = hold_pin_config();
+    let _ = config::set_retry(config::RetryPatch {
+        count: Some(0),
+        account_switch_count: Some(2),
+        interval_seconds: Some(0),
+        no_retry_codes: Some(Vec::new()),
+    });
+    let _ = config::set_pinned_upstream(config::PinnedUpstreamPatch {
+        enabled: Some(true),
+        ips: Some(vec!["1.1.1.1".into(), "2.2.2.2".into()]),
+        status_codes: Some(vec![502]),
+        wait_timeout_seconds: Some(0),
+        current_ip: Some("1.1.1.1".into()),
+    });
+
+    let (endpoint, hits, task) = counting_error_mock(502).await;
+    let (_dir, service) = service_with_accounts(&endpoint, 3);
+    let (result, snapshot) = run_account_loop(&service, &chat_body()).await;
+    task.abort();
+
+    assert!(result.is_err(), "三个账号全 502，这次请求应当以失败收场");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        3,
+        "换号预算 2 ⇒ 三个账号各打一次，实际 {} 次",
+        hits.load(Ordering::SeqCst)
+    );
+    let notes: Vec<String> = snapshot
+        .attempts_detail
+        .iter()
+        .flat_map(|detail| detail.retries.iter().map(|event| event.reason.clone()))
+        .filter(|reason| reason.contains("固定上游 IP 切换"))
+        .collect();
+    assert_eq!(notes.len(), 2, "两次换号 ⇒ 恰好两条切换记录：{notes:?}");
+    assert!(
+        notes[0].contains("1.1.1.1 换成 2.2.2.2"),
+        "第一次切换应当落在列表的下一个（2.2.2.2）：{}",
+        notes[0]
+    );
+    assert!(
+        notes[1].contains("2.2.2.2 换成 1.1.1.1"),
+        "列表只有两项，第二次切换必须回到头部（游标回环）：{}",
+        notes[1]
+    );
+    assert_eq!(
+        config::pinned_upstream_settings().current_ip,
+        "1.1.1.1",
+        "转满一圈后组当前 IP 回到第一个"
+    );
+}
