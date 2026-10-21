@@ -527,15 +527,22 @@ body.queue-dragging * { cursor: grabbing !important; }
 /* 组头「固定上游 IP」当前值（只有 WorkBuddy 国际版、且开关打开时渲染）。
    等宽字体读 IP，右侧一个小按钮手动切下一个。
    颜色用中性两档，不抢组名的份量 —— 它是一个读数，不是标题。 */
+/* 组标题后的当前上游 IP：「上游 IP: 1.2.3.4 ⟳」。
+   前缀用正文字体（它是标签，不是地址），地址用等宽体（逐位核对是这个功能的
+   日常动作：两个 IP 常常只差最后一组数字，比例字体下极易看错）。 */
 .grp-pin {
   display: inline-flex;
   align-items: center;
-  gap: 2px;
+  gap: 4px;
   padding: 0 2px 0 6px;
   border: 1px solid var(--border);
   border-radius: var(--r-sm, 4px);
   background: var(--surface);
   white-space: nowrap;
+}
+.grp-pin-label {
+  font-size: 11px;
+  color: var(--text-3);
 }
 .grp-pin-ip {
   font-family: var(--font-mono);

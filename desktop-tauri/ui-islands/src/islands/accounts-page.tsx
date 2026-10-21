@@ -597,7 +597,7 @@ function AccountsPage() {
                 const rows = pageRows.filter(account => providerOf(account) === group.provider)
                 return (
                   <tbody key={group.provider} className='acct-group' data-provider={group.provider}>
-                    <GroupBandRow group={group} collapsed={collapsed} colSpan={columns.length} />
+                    <GroupBandRow group={group} collapsed={collapsed} colSpan={columns.length} upstreamIp={store.upstreamIp} />
                     {collapsed ? null : rows.map(account => {
                       // 组内序号取**全量成员**里的位次（不是当前页 / 当前可见里的位次）：
                       // 筛选时号会跳，但号本身说的是「在这一家里的第几位」这个事实

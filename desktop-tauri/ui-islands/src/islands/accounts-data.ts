@@ -357,25 +357,39 @@ export function refreshCaches(validIds: Set<string>): void {
 }
 
 /**
- * 把「上游 IP 列该不该出现」同步进 store。
+ * 把固定上游 IP 的两处投影一起同步进 store：**列显隐**与**组徽标读数**。
  *
  * 判据是后端那份配置的 `enabled && ips.length > 0` —— 与 `UpstreamIpCell`
  * 判断单元格要不要渲染的口径**必须一致**，否则会出现「表头在、格子在」或
  * 「表头没了、格子还在」两种错位。
+ *
+ * ── 为什么两处必须在这一个函数里一起写 ──────────────────────
+ * 它们是同一个开关的两个投影（列 + 组标题后的徽标）。曾经徽标自己读一次，
+ * 结果「页面上开开关 → 列变了、徽标不变」「页面上关开关 → 徽标赖着不走」。
+ * 一个函数、一次 `patch`，两者就不可能停在两份不同的快照上。
  *
  * 读失败（网关没起来 / 桥没注入）时按「不显示」处理：宁可少一列，也不要在
  * 一个读不到配置的环境里给每个 provider 都挂一条空列。
  */
 async function syncUpstreamIpColumn(): Promise<void> {
   let visible = false
+  let currentIp = ''
   try {
     const response = await shared().workbuddyDesktop?.getPinnedUpstream?.()
     const settings = response?.pinnedUpstreamIp
     visible = Boolean(settings?.enabled && (settings.ips?.length ?? 0) > 0)
+    currentIp = visible ? String(settings?.currentIp || '').trim() : ''
   } catch {
     visible = false
   }
-  if (getStore().upstreamIpVisible !== visible) patch({ upstreamIpVisible: visible })
+  const before = getStore().upstreamIp
+  const nextVisible = visible && currentIp !== ''
+  // 两处都没变就不写 store：这条链路每 20 秒跑一次，无谓的 patch 会让整页重画
+  if (before?.visible === nextVisible && before?.currentIp === currentIp) return
+  patch({
+    upstreamIpVisible: nextVisible,
+    upstreamIp: { visible: nextVisible, currentIp },
+  })
 }
 
 /* ─── 连接数（实时，2 秒一轮）────────────────────

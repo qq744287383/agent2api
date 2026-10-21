@@ -103,6 +103,7 @@
   "一般不用填": "Usually left blank",
   "万": "10k",
   "上游 IP": "Upstream IP",
+  "上游 IP:": "Upstream IP:",
   "上游未给总量，画不出剩余比例": "The upstream gave no total, so the remaining ratio cannot be drawn",
   "上游本来不要凭证时（本地 Ollama、OpenCode Zen 的免费档）勾上这一项：账号会被正常选路；只把 Key 留空": "Check this when the upstream does not need credentials (local Ollama, the OpenCode Zen free tier): the account is still routed normally; just leave the Key blank",
   "上游的 API Key。留空 = 不修改（改凭证不会换账号 id）；要清掉已配的凭证用右边的「清除」": "The upstream API Key. Leave blank = no change (editing a credential does not change the account id); to remove a configured credential use \"Clear\" on the right",

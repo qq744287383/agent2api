@@ -57,6 +57,7 @@ import {
   poolError, proxyPoolSnapshot, queryUsageOnce, setAccountEnabled, setGroupEnabled, setPanelOpen,
   tokenUsageOf, toggleGroupCollapsed, toggleNamesHidden, usageEntryOf, usageFailureOf,
 } from './accounts-data'
+import type { UpstreamIpReadout } from './accounts-store'
 import type { AccountGroup } from './accounts-domain'
 import { PROVIDER_ICONS } from './add-provider-pick'
 import { t } from '../i18n'
@@ -164,21 +165,13 @@ function GroupMenu({ group, ids, collapsed }: { group: AccountGroup; ids: string
  * 数据来自 `/api/pinned-upstream-ip`（懒读一次，组头渲染不阻塞在它上面 ——
  * 读不到就什么都不显示，不报错也不占位）。
  */
-function GroupPinnedIpBadge() {
-  const [state, setState] = React.useState<{ enabled: boolean; currentIp: string } | null>(null)
+function GroupPinnedIpBadge({ readout }: { readout: UpstreamIpReadout | null }) {
   const [busy, setBusy] = React.useState(false)
 
-  const load = React.useCallback(async () => {
-    const response = await shared().workbuddyDesktop?.getPinnedUpstream?.()
-    const settings = response?.pinnedUpstreamIp
-    setState(settings ? { enabled: settings.enabled, currentIp: settings.currentIp } : null)
-  }, [])
+  if (!readout?.visible || !readout.currentIp) return null
+  const currentIp = readout.currentIp
 
-  React.useEffect(() => { void load() }, [load])
-
-  if (!state?.enabled || !state.currentIp) return null
-
-  /** 手动前进一个 IP：写回 currentIp 后重读（后端会校验它确实在列表里）。 */
+  /** 手动前进一个 IP：写回 currentIp 后等面板同步（后端会校验它确实在列表里）。 */
   async function rotate(): Promise<void> {
     if (busy) return
     setBusy(true)
@@ -190,10 +183,12 @@ function GroupPinnedIpBadge() {
         toast(t('只有一条 IP，无法切换'), 'err')
         return
       }
-      const index = ips.indexOf(state!.currentIp)
+      const index = ips.indexOf(currentIp)
       const next = ips[(index + 1) % ips.length]
       await shared().workbuddyDesktop?.savePinnedUpstream?.({ currentIp: next })
-      await load()
+      // 与开关同一套命令：刷新面板 → `refreshCaches` → `syncUpstreamIpColumn`
+      // 一次写进 store。徽标与「上游 IP」列因此总在同一帧里更新。
+      await shared().wbApp?.refresh?.()
       toast(t('已切换到上游 IP {ip}', { ip: next }))
     } catch (error) {
       toast(errorMessage(error), 'err')
@@ -203,8 +198,12 @@ function GroupPinnedIpBadge() {
   }
 
   return (
-    <span className='grp-pin' title={t('固定上游 IP：组内「跟随组」的账号都用这个地址访问上游')}>
-      <span className='grp-pin-ip'>{state.currentIp}</span>
+    <span
+      className='grp-pin'
+      title={t('固定上游 IP：组内「跟随组」的账号都用这个地址访问上游')}
+    >
+      <span className='grp-pin-label'>{t('上游 IP:')}</span>
+      <span className='grp-pin-ip'>{currentIp}</span>
       <button
         type='button'
         className='grp-iconbtn grp-pin-rotate'
@@ -372,10 +371,12 @@ function GroupBalanceBadge({ balance }: { balance: GroupBalance }) {
  * 样式刻意保持中性（surface 底 + 一条 hairline）：一家一色会让整页像调色板，
  * 而「哪一段是哪一家」由家名与图标已经说清楚了。
  */
-export function GroupBandRow({ group, collapsed, colSpan }: {
+export function GroupBandRow({ group, collapsed, colSpan, upstreamIp }: {
   group: AccountGroup
   collapsed: boolean
   colSpan: number
+  /** 固定上游 IP 的当前生效值（store 的读数；`null` = 还没读到 / 关着） */
+  upstreamIp: UpstreamIpReadout | null
 }) {
   const icon = PROVIDER_ICONS[group.provider]
   // 合计只在「有求和的余地」时出现：一个账号的组，合计与下面那行读数逐字重复；
@@ -399,7 +400,7 @@ export function GroupBandRow({ group, collapsed, colSpan }: {
               : <span className='grp-logo-txt'>{String(group.label || '?').trim().slice(0, 1).toUpperCase()}</span>}
           </span>
           <span className='grp-name'>{t(group.label)}</span>
-          {group.provider === 'workbuddy-intl' && <GroupPinnedIpBadge />}
+          {group.provider === 'workbuddy-intl' && <GroupPinnedIpBadge readout={upstreamIp} />}
           <span className='grp-stat'>{t('{total} 个账号 · 启用 {enabled} · 禁用 {disabled}{limited}', {
             total: group.members.length,
             enabled: group.enabled,

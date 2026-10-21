@@ -103,6 +103,7 @@
   "一般不用填": "Normalmente não é preciso preencher",
   "万": "10 mil",
   "上游 IP": "IP de upstream",
+  "上游 IP:": "IP de upstream:",
   "上游未给总量，画不出剩余比例": "O upstream não informou o total; não é possível calcular a proporção restante",
   "上游本来不要凭证时（本地 Ollama、OpenCode Zen 的免费档）勾上这一项：账号会被正常选路；只把 Key 留空": "Quando o upstream não exigir credencial (Ollama local, plano gratuito do OpenCode Zen), marque esta opção: a conta será selecionada normalmente; deixe apenas a Key em branco",
   "上游的 API Key。留空 = 不修改（改凭证不会换账号 id）；要清掉已配的凭证用右边的「清除」": "API Key do upstream. Em branco = não alterar (mudar a credencial não troca o id da conta); para remover a credencial configurada, use 「Limpar」 à direita",

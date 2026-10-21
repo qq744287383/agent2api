@@ -237,6 +237,7 @@ export function AccountsPage() {
                 <div style={{ display: 'flex', alignItems: 'center', gap: 4, flex: 'none' }}>
                   {pin?.enabled && pin.currentIp ? (
                     <span className='m-pin' title={t('固定上游 IP：组内「跟随组」的账号都用这个地址访问上游')}>
+                      <span className='m-pin-label'>{t('上游 IP:')}</span>
                       <span className='m-pin-ip'>{pin.currentIp}</span>
                       <button
                         type='button'

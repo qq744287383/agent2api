@@ -38,6 +38,19 @@ export type AccountsDialog =
   | { kind: 'pinned-upstream'; provider: string }
   | null
 
+/**
+ * 组标题后面那枚徽标需要的读数（`/api/pinned-upstream-ip` 的两个字段）。
+ *
+ * 只留这两项：`visible` 判据用的是 `enabled && ips.length`，徽标要显示的是
+ * `currentIp`，其余字段（超时 / 状态码）只有弹窗关心，不进 store。
+ */
+export type UpstreamIpReadout = {
+  /** 开关开着且列表非空 —— 与「上游 IP」列的显隐判据**同一个表达式** */
+  visible: boolean
+  /** 组当前 IP（`visible` 为真时必然非空，见后端的 `effective_current_ip`） */
+  currentIp: string
+}
+
 export type AccountsStore = {
   /** 每次变更 +1；React 靠它判断「该重画了」（快照对象同时被换掉） */
   version: number
@@ -64,6 +77,20 @@ export type AccountsStore = {
    * 而这份状态在一次渲染里不会变。由账号页在拿到快照时写入。
    */
   upstreamIpVisible: boolean
+  /**
+   * 固定上游 IP 的**当前生效值**（组标题后面那枚徽标读它）。
+   *
+   * ── 为什么它必须在 store 里，而不能像原来那样「组件挂载时读一次」──
+   * 组徽标与「上游 IP」列是同一个开关的两个投影，它们必须**同时**变。原实现
+   * 让徽标自己读一次 API（`useEffect([])`），于是：
+   *   · 在页面上打开开关 → 列跟着 20 秒轮询变了，徽标纹丝不动；
+   *   · 在页面上关掉开关 → 徽标赖着不走，直到用户手动刷新整个页面。
+   * 两个投影读同一个字段、走同一条轮询，这类「半新半旧」的错位从结构上就不该
+   * 存在（见 GLOSSARY 的「固定上游 IP」）。
+   *
+   * `null` = 还没读到 / 读失败（此时徽标不渲染）。
+   */
+  upstreamIp: UpstreamIpReadout | null
   /** 余额查询在途的账号（行上那颗「余额」按钮的去重闸） */
   usageInflight: ReadonlySet<string>
 }
@@ -130,6 +157,7 @@ let store: AccountsStore = {
   namesHidden: loadNamesHidden(),
   usageBusy: false,
   upstreamIpVisible: false,
+  upstreamIp: null,
   usageInflight: new Set<string>(),
 }
 
