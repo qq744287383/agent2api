@@ -373,6 +373,14 @@ pub struct AttemptDetail {
     /// 「只记体积不记内容」的口径见 `core::upstream::usage::AttemptDetail::body_bytes`。
     #[serde(rename = "bodyBytes", default)]
     pub body_bytes: Option<i64>,
+    /// 这一轮**实际访问的上游 IP**（固定上游 IP 开着才有值）。
+    ///
+    /// 与 `account` / `retries` / `notice` 同一形态：加的是 `attemptDetails`
+    /// 这个 **JSON 文本列内部的键**，列本身早就存在 —— 所以**不需要动数据库
+    /// schema**，旧行的 JSON 里没有这个键，`default` 读成 None，展示层不渲染。
+    /// 采集侧的来由见 `core::upstream::usage::AttemptDetail::upstream_ip`。
+    #[serde(rename = "upstreamIp", default)]
+    pub upstream_ip: Option<String>,
 }
 
 /// 一次尝试内部的退避重试（存储契约，与采集侧同形各自定义）。
@@ -622,6 +630,9 @@ impl NewRequestEntry {
                     notice: item.notice.filter(|text| !text.is_empty()),
                     // 体字节数原样透传（None = 这一轮没发出去；采集侧的理由见 usage 的字段说明）
                     body_bytes: item.body_bytes,
+                    // 实际访问的 IP：空串收敛成 None（与 error / notice 同一口径 ——
+                    // 「没固定」这件事由 None 表达，空串只是没写值）
+                    upstream_ip: item.upstream_ip.filter(|text| !text.is_empty()),
                 })
                 .collect(),
             sensitive_hits: self

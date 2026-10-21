@@ -437,6 +437,18 @@ pub struct AttemptDetail {
     /// 只记体积、不记内容：体积是运维事实，正文是用户数据。
     #[serde(rename = "bodyBytes", default)]
     pub body_bytes: Option<i64>,
+    /// 这一轮**实际访问的上游 IP**（固定上游 IP 开着时才有值）。
+    ///
+    /// ── 为什么要逐轮记，而不是读一下当前配置充数 ──────────────
+    /// 一次请求可能换过好几种 IP（自动切换每切一次就换一个，见
+    /// `provider_loop::advance_pin_and_switch`）；配置里的 `currentIp` 说的是
+    /// 「这一组**现在**用哪个」，回答不了「**这一次**打到哪个」。而在排查
+    /// 「这次请求到底走了哪条线」时，人们指的永远是后者 —— 那是已经发生的事实，
+    /// 而前者随时会被下一次切换改写。
+    ///
+    /// `None` = 这一轮没有固定（开关关着 / 走了代理 / 本地就失败了）。
+    #[serde(rename = "upstreamIp", default)]
+    pub upstream_ip: Option<String>,
 }
 
 /// 一次**尝试内部**的退避重试（`AttemptDetail::retries` 的元素）。
@@ -490,6 +502,11 @@ pub const MAX_ATTEMPT_ERROR_CHARS: usize = 200;
 /// 而弹层里它与 provider 名同处一行。60 个字符足够放一个邮箱加中文昵称，
 /// 再长就让它省略 —— 明细是「一眼看清谁承载了这一轮」的读数，不是账号名片。
 pub const MAX_ATTEMPT_ACCOUNT_CHARS: usize = 60;
+/// 上游 IP 的展示上限（IPv4 最多 15 字符；留一倍余量，将来万一要写 host:port）。
+///
+/// 与账号名同一条取舍：落库前截断，避免一条脏值把 `attemptDetails` 那个 JSON
+/// 列撑大 —— 那一列是每条请求都存一份的。
+const MAX_ATTEMPT_UPSTREAM_IP_CHARS: usize = 32;
 
 /// 单条重试原因的字符上限。
 ///
@@ -886,6 +903,7 @@ impl RequestTelemetry {
             retries: Vec::new(),
             notice: None,
             body_bytes: None,
+            upstream_ip: None,
         });
         // 阶段：新一轮的请求**即将发出** → 等待响应（含模型思考）。
         // 位置与 OmniProxy 的「连接已建立、请求即将发出」同一时点：本函数就在
@@ -893,6 +911,24 @@ impl RequestTelemetry {
         // 排队 / 选路 / 取凭证 / 建连这一段 —— 与那边的分界一致。
         self.enter_phase(&mut guard, LogPhase::Waiting);
         // 在途回写：新的一轮进了尝试链（换号时这一步就让「重试」列出现）
+        self.flush_live(&guard);
+    }
+
+    /// 给**最后一条**尝试明细补上这一轮实际访问的上游 IP。
+    ///
+    /// 与 [`Self::note_attempt_started`] 配对（起头那条只知道「谁」，IP 要等
+    /// 构造好传输请求才定得下来）。固定上游 IP 关着时传 `None` —— 那是一个
+    /// 有意义的事实（走了系统 DNS），不是「没有数据」。
+    pub fn note_attempt_upstream_ip(&self, upstream_ip: Option<&str>) {
+        let mut guard = self.lock();
+        let Some(last) = guard.attempts_detail.last_mut() else {
+            return;
+        };
+        last.upstream_ip = upstream_ip
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(|text| truncate_chars(text, MAX_ATTEMPT_UPSTREAM_IP_CHARS));
+        // 在途回写：一行「这次打到哪条线」只有立刻可见才有排查价值
         self.flush_live(&guard);
     }
 

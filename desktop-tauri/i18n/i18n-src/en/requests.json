@@ -19,6 +19,7 @@
   "↻ 重试 {n} 次": "↻ Retried {n} times",
   "✅ 压缩完成": "✅ Vacuum complete",
   "「仅看进行中」开启时，状态固定为进行中": "When \"In progress only\" is on, the status is pinned to In progress",
+  "上游IP": "Upstream IP",
   "上游模型繁忙，请求已排进上游队列；网关正按上游建议的时长等待后重发（不是登录态或额度问题）": "Upstream model is busy; the request is queued upstream and the Gateway will resend it after the wait suggested by the upstream (not a login-session or quota problem)",
   "上游状态码: {status}": "Upstream status code: {status}",
   "上游请求已发出，正在等第一个字节到达（模型的思考时间也在这段）": "Upstream request sent, waiting for the first byte to arrive (model thinking time is included here)",
@@ -186,6 +187,7 @@
   "首响：上游首帧到达的耗时（请求仍在转发中）": "TTFB: time to first byte from the upstream (request is still being forwarded)",
   "首帧已到，上游内容正在下发": "First byte received; upstream content is streaming in",
   "（请求仍在转发中）": "(request is still being forwarded)",
+  "（账号：{account} | 上游IP：{ip}）": "(account: {account} | upstream IP: {ip})",
   "（账号：{account}）": "(Account: {account})",
   "，{n}毫秒后重试": ", retry in {n}ms",
   "，{n}秒后重试": ", retry in {n}s"

@@ -1398,6 +1398,14 @@ async fn attempt_queue(
                     target.proxy.is_some(),
                 ),
             };
+            // ── 这一轮实际访问的上游 IP ────────────────────────────────
+            // 位置与 `transport` 同源：`pin` 就在这里定稿，之后不会变。记在
+            // 「即将发送」这一刻，而不是收尾时读配置 —— 配置里的 currentIp
+            // 说的是「这一组现在用哪个」，而这一条要回答的是「这一次打到哪个」，
+            // 自动切换会让同一次请求里两者分道扬镳（见 usage 的字段说明）。
+            ctx.telemetry.note_attempt_upstream_ip(
+                transport.pin.as_ref().map(|pin| pin.ip.to_string()).as_deref(),
+            );
             // ── 调试模式：抓一份即将发出去的原始报文 ──────────────────
             // 位置在 `build_chat_request` 之后（URL / 头 / body 都已定稿）。
             // 每次尝试前刷新一次（退避重试与 401 刷新重试都会走到这里），

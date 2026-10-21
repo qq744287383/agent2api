@@ -19,6 +19,7 @@
   "↻ 重试 {n} 次": "↻ {n} retries",
   "✅ 压缩完成": "✅ Compactação concluída",
   "「仅看进行中」开启时，状态固定为进行中": "Com “Somente em andamento” ativado, o status fica fixo em Em andamento",
+  "上游IP": "IP de upstream",
   "上游模型繁忙，请求已排进上游队列；网关正按上游建议的时长等待后重发（不是登录态或额度问题）": "O modelo do upstream está ocupado e a requisição entrou na fila do upstream; o Gateway aguarda o tempo sugerido pelo upstream antes de reenviar (não é problema de estado de login nem de cota)",
   "上游状态码: {status}": "Status do upstream: {status}",
   "上游请求已发出，正在等第一个字节到达（模型的思考时间也在这段）": "A requisição foi enviada ao upstream; aguardando a chegada do primeiro byte (o tempo de raciocínio do modelo também faz parte disso)",
@@ -186,6 +187,7 @@
   "首响：上游首帧到达的耗时（请求仍在转发中）": "1ª resposta: tempo até o primeiro frame do upstream chegar (a requisição ainda está sendo encaminhada)",
   "首帧已到，上游内容正在下发": "O primeiro frame chegou; o upstream está enviando o conteúdo",
   "（请求仍在转发中）": "(a requisição ainda está sendo encaminhada)",
+  "（账号：{account} | 上游IP：{ip}）": "(conta: {account} | IP de upstream: {ip})",
   "（账号：{account}）": "(conta: {account})",
   "，{n}毫秒后重试": ", retry em {n}ms",
   "，{n}秒后重试": ", retry em {n}s"

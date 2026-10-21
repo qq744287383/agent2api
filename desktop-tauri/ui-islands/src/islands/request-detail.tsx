@@ -78,6 +78,10 @@ type AttemptDetail = {
   notice?: unknown
   /** 这一轮实际发给上游的体字节数（缺 = 没发出去过）*/
   bodyBytes?: unknown
+  /** 这一轮实际访问的上游 IP（缺 = 没固定上游 IP）。
+   *  逐轮记而不是读当前配置：一次请求可能切换过好几个 IP，
+   *  能回答「这一次打到哪」的只有它。 */
+  upstreamIp?: unknown
 }
 
 /** 敏感词命中：词 + 次数 */
@@ -432,7 +436,7 @@ function AttemptsTable({ row }: { row: RequestRow }) {
     <Table className='text-[11.5px]'>
       <TableHeader>
         <TableRow className={NO_HOVER}>
-          {[t('轮次'), t('提供商'), t('账号'), t('结果'), t('体积'), t('内部重试'), t('提示')].map(label => (
+          {[t('轮次'), t('提供商'), t('账号'), t('上游IP'), t('结果'), t('体积'), t('内部重试'), t('提示')].map(label => (
             <TableHead key={label} className={ATTEMPT_HEAD}>{label}</TableHead>
           ))}
         </TableRow>
@@ -470,6 +474,12 @@ function AttemptsTable({ row }: { row: RequestRow }) {
                 {providerName(item) || (item?.provider ? String(item.provider) : t('未知'))}
               </TableCell>
               <TableCell className={ATTEMPT_CELL}>{item?.account ? String(item.account) : '—'}</TableCell>
+              {/* 这一轮实际访问的 IP（等宽体：两个 IP 常常只差最后一组数字，
+                  比例字体下逐位核对极易看错）。没固定时给「—」而不是空白 ——
+                  「这一轮没走固定 IP」本身就是一次自动切换排查里的关键信息。 */}
+              <TableCell className={`${ATTEMPT_CELL} whitespace-nowrap font-mono`}>
+                {String(item?.upstreamIp ?? '').trim() || '—'}
+              </TableCell>
               <TableCell className={ATTEMPT_CELL}>{attemptResult(item)}</TableCell>
               <TableCell className={`${ATTEMPT_CELL} whitespace-nowrap`} title={bodyTitle}>
                 {bodyText}
@@ -483,7 +493,7 @@ function AttemptsTable({ row }: { row: RequestRow }) {
         })}
         {details.length < attempts ? (
           <TableRow className={NO_HOVER}>
-            <TableCell colSpan={7} className={`${ATTEMPT_CELL} text-muted-foreground`}>
+            <TableCell colSpan={8} className={`${ATTEMPT_CELL} text-muted-foreground`}>
               {t('另有 {missing} 次尝试未记录明细（只保留最早的 {kept} 条）', {
                 missing: attempts - details.length, kept: details.length,
               })}
@@ -551,6 +561,31 @@ function RouteReplay({ row }: { row: RequestRow }) {
   )
 }
 
+/**
+ * 这一条请求**实际访问过**的上游 IP（没有则空串）。
+ *
+ * ── 为什么取「最后一条有值的明细」而不是第一条 ──────────────
+ * 明细链是「试了谁 → 又试了谁 → 谁成功了」。自动切换每切一次 IP 就换一个值，
+ * 而用户在详情里问的「这次打到哪个 IP」，指的是**最终真正拿到响应**的那一条 ——
+ * 中间失败的几轮只是过程。所以从头往后取、最后一个有值的胜出。
+ *
+ * 全部为空（开关关着 / 走了代理 / 每次都在本机就失败）= 返回空串，
+ * 界面据此回到改造前的形态（括号里只有账号）。
+ *
+ * 值来自每轮尝试自己的记录（`attemptDetails[].upstreamIp`），不是当前配置的
+ * `currentIp`：后者说的是「这一组**现在**用哪个」，与「**这一次**打到哪个」
+ * 是两件事 —— 自动切换之后它们往往不是同一个值。
+ */
+function actualUpstreamIp(row: RequestRow): string {
+  const details = Array.isArray(row.attemptDetails) ? row.attemptDetails : []
+  let found = ''
+  for (const item of details) {
+    const value = String(item?.upstreamIp ?? '').trim()
+    if (value) found = value
+  }
+  return found
+}
+
 /* ─── 标签 ①：请求详情（数据全部来自 row）────── */
 
 function DetailPane({ row }: { row: RequestRow | null }) {
@@ -558,6 +593,7 @@ function DetailPane({ row }: { row: RequestRow | null }) {
   // 没有可显示的数据 —— 说清原因让用户关掉重开，比一片空字段诚实
   if (!row) return <Empty text={t('列表数据已刷新，请重试（关闭后重新打开这条详情）')} />
   const account = String(row.accountName ?? '').trim()
+  const upstreamIp = actualUpstreamIp(row)
   const speed = fmtTokensPerSecond(row)
   return (
     // 值列基色打在 table 上靠继承（继承永远输给元素上的直接声明），格内的错误红 / 成功绿不会被压住
@@ -582,7 +618,18 @@ function DetailPane({ row }: { row: RequestRow | null }) {
         <Field label={t('模型')}><ModelCell row={row} /></Field>
         <Field label={t('提供商')}>
           {providerName(row) || '—'}
-          {account ? <span className='text-[11.5px] text-muted-foreground'>{t('（账号：{account}）', { account })}</span> : null}
+          {/* 括号里报「谁在承载」与「实际走了哪条线」。
+              固定上游 IP 关着时只有一个账号（与改造前逐字一致）；开着时补上
+              上游 IP —— 用户排查「这次请求到底打到哪个 IP」时看的就是这一处。
+              IP 取**实际访问**的那个（每轮尝试自己记的），不是当前配置里的
+              `currentIp`：自动切换会让两者不是同一个值。 */}
+          {account || upstreamIp ? (
+            <span className='text-[11.5px] text-muted-foreground'>
+              {upstreamIp
+                ? t('（账号：{account} | 上游IP：{ip}）', { account: account || t('未知'), ip: upstreamIp })
+                : t('（账号：{account}）', { account: account || t('未知') })}
+            </span>
+          ) : null}
         </Field>
         <Field label={t('令牌')}>
           {t('输入 {input} · 输出 {output} · 总计 {total} · 缓存读 {cache}', {
