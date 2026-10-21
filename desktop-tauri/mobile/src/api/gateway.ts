@@ -91,6 +91,66 @@ export function refreshExpiringAccounts(): Promise<unknown> {
   return apiCall('/api/accounts/refresh-expiring', { method: 'POST' })
 }
 
+/* ─── 固定上游 IP ─────────────────────────────── */
+
+/**
+ * 固定上游 IP 的设置块（`GET/PUT /api/pinned-upstream-ip` 的
+ * `pinnedUpstreamIp` 子对象）。
+ *
+ * 键名与后端的字段常量一一对应（`FIELD_PIN_*`），这里不另起命名 ——
+ * 手机端与桌面端读的是同一份契约。
+ */
+export type PinnedUpstreamSettings = {
+  enabled: boolean
+  /** IPv4 列表；顺序就是轮换顺序 */
+  ips: string[]
+  /** 0 = 跟随全局 `headersTimeoutSeconds` */
+  waitTimeoutSeconds: number
+  /** 命中即切换的异常响应状态码 */
+  statusCodes: number[]
+  /** 组当前 IP（后端已按列表校正：不在列表里时给首项） */
+  currentIp: string
+}
+
+export type PinnedUpstreamPayload = {
+  pinnedUpstreamIp: PinnedUpstreamSettings
+  /** 只读回显：界面要写「0 = 跟随全局（当前 N 秒）」 */
+  globalWaitTimeoutSeconds: number
+  /** 生效值（用户值与全局取小）；手机端目前只回显全局值，留着备查 */
+  effectiveWaitTimeoutSeconds: number
+}
+
+/**
+ * 读固定上游 IP 设置。
+ *
+ * 手机端把这份设置当成**组头的一枚读数**：当前 IP、能不能切、要不要显示
+ * 账号级的 IP 下拉，都从它来。
+ */
+export function getPinnedUpstream(): Promise<PinnedUpstreamPayload> {
+  return apiCall<PinnedUpstreamPayload>('/api/pinned-upstream-ip')
+}
+
+/**
+ * 保存固定上游 IP（只传要改的字段）。
+ *
+ * 两个调用方各传各的：设置面板传整张表单，组头那个切换按钮**只传
+ * `currentIp`**。后端按「合并后的值」校验「开了就必须有 IP」，所以分两步
+ * 传也成立。
+ */
+export function savePinnedUpstream(
+  patch: Partial<PinnedUpstreamSettings>,
+): Promise<PinnedUpstreamPayload> {
+  return apiCall<PinnedUpstreamPayload>('/api/pinned-upstream-ip', { method: 'PUT', body: patch })
+}
+
+/** 给单个账号指定上游 IP；`null` = 回到「跟随组」。 */
+export function setAccountPinnedUpstreamIp(id: string, ip: string | null): Promise<unknown> {
+  return apiCall(`/api/accounts/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    body: { pinnedUpstreamIp: ip },
+  })
+}
+
 /* ─── 报表 ─────────────────────────────────────── */
 
 export type StatsOverview = {

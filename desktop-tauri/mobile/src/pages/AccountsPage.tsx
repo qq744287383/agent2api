@@ -1,10 +1,17 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { PageHead, IconButton, Badge, Empty, ErrorNote, SkeletonList } from '../components/ui'
 import { ProviderLogo } from '../components/ProviderLogo'
 import { Icon } from '../components/Icon'
 import { AccountSheet } from './AccountSheet'
+import { PinnedUpstreamSheet } from './PinnedUpstreamSheet'
 import { useStore, store } from '../state/store'
-import { setAccountEnabled, type Account } from '../api/gateway'
+import {
+  getPinnedUpstream,
+  savePinnedUpstream,
+  setAccountEnabled,
+  type Account,
+  type PinnedUpstreamSettings,
+} from '../api/gateway'
 import { accountName, formatExpiry, formatRelative } from '../lib/format'
 import { expiryOf, hasExpiry } from '../lib/providerFacts'
 import { providerLabel } from '../lib/providers'
@@ -22,6 +29,11 @@ import { t } from '../i18n'
  * ── 分组口径 ──────────────────────────────────────────────────
  * 与后端一致：同一提供商的账号是一组，组内按 priority 升序（= 转发尝试顺序）。
  * 组本身的先后也按最小 priority 排 —— 这就是全局队列在手机上的投影。
+ *
+ * ── 组的设置入口放哪 ──────────────────────────────────────────
+ * 桌面端把「固定上游 IP」挂在组标题的 ⋯ 菜单里；手机没有菜单，所以直接给
+ * 组头右侧两个入口：开着一枚「当前 IP + 切换」的读数（最常用的动作一步可达），
+ * 加一个齿轮进设置抽屉。只有 WorkBuddy 国际版这一组有 —— 别家没有这个概念。
  */
 
 type Filter = 'all' | 'enabled' | 'limited' | 'disabled'
@@ -33,7 +45,47 @@ export function AccountsPage() {
   const [openId, setOpenId] = useState<string | null>(null)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  // 固定上游 IP：组头那枚读数 + 设置抽屉共用这一份设置
+  const [pin, setPin] = useState<PinnedUpstreamSettings | null>(null)
+  const [pinOpen, setPinOpen] = useState(false)
+  const [rotating, setRotating] = useState(false)
   const accounts = state.session?.accounts?.accounts || []
+
+  const loadPin = async (): Promise<void> => {
+    try {
+      const payload = await getPinnedUpstream()
+      setPin(payload.pinnedUpstreamIp)
+    } catch {
+      // 读不到就只留齿轮入口（抽屉里会给出具体错误）：不能让一个次要读数
+      // 把整页的错误条点亮
+    }
+  }
+
+  // 只在进页面时读一次；之后的变更由抽屉保存 / 切换按钮各自刷新
+  useEffect(() => {
+    void loadPin()
+  }, [])
+
+  /** 手动前进一个 IP（组策略）：只影响之后的请求，不动正在跑的连接。 */
+  const rotatePin = async (): Promise<void> => {
+    if (!pin || rotating) return
+    if (pin.ips.length < 2) {
+      store.toast(t('只有一条 IP，无法切换'), 'err')
+      return
+    }
+    setRotating(true)
+    try {
+      const index = pin.ips.indexOf(pin.currentIp)
+      const next = pin.ips[(index + 1) % pin.ips.length]
+      const payload = await savePinnedUpstream({ currentIp: next })
+      setPin(payload.pinnedUpstreamIp)
+      store.toast(t('已切换到上游 IP {ip}', { ip: next }))
+    } catch (failure) {
+      store.toast(failure instanceof Error ? failure.message : String(failure), 'err')
+    } finally {
+      setRotating(false)
+    }
+  }
 
   usePolling(async () => {
     try {
@@ -181,6 +233,34 @@ export function AccountsPage() {
                   {limited ? t(' · 限流 {n}', { n: limited }) : ''}
                 </div>
               </div>
+              {group.provider === PINNED_PROVIDER ? (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 4, flex: 'none' }}>
+                  {pin?.enabled && pin.currentIp ? (
+                    <span className='m-pin' title={t('固定上游 IP：组内「跟随组」的账号都用这个地址访问上游')}>
+                      <span className='m-pin-ip'>{pin.currentIp}</span>
+                      <button
+                        type='button'
+                        className='m-pin-rotate'
+                        disabled={rotating}
+                        aria-label={t('切换上游 IP')}
+                        title={t('手动切换到下一个上游 IP（只影响之后的请求）')}
+                        onClick={() => void rotatePin()}
+                      >
+                        <Icon name='refresh' />
+                      </button>
+                    </span>
+                  ) : null}
+                  <button
+                    type='button'
+                    className='m-pin-gear'
+                    aria-label={t('固定上游 IP')}
+                    title={t('固定上游 IP')}
+                    onClick={() => setPinOpen(true)}
+                  >
+                    <Icon name='settings' />
+                  </button>
+                </div>
+              ) : null}
             </div>
             <div className='m-card'>
               {group.list.map((account, index) => (
@@ -223,6 +303,17 @@ export function AccountsPage() {
         account={openAccount}
         onClose={() => setOpenId(null)}
         onChanged={() => void store.refresh(true)}
+      />
+
+      <PinnedUpstreamSheet
+        open={pinOpen}
+        onClose={() => setPinOpen(false)}
+        onSaved={() => {
+          // 保存可能重置了一批账号的独立 IP（列表变了的时候），所以账号列表
+          // 也要重读 —— 不只是设置本身
+          void loadPin()
+          void store.refresh(true)
+        }}
       />
     </div>
   )
@@ -379,6 +470,9 @@ function SwitchSmall({
     </button>
   )
 }
+
+/** 固定上游 IP 只作用于这一家（见 ADR-0001：国内版另有 growth 域，未评估） */
+const PINNED_PROVIDER = 'workbuddy-intl'
 
 function hasRateLimit(account: { rateLimits?: Record<string, unknown> }): boolean {
   return Boolean(account.rateLimits && Object.keys(account.rateLimits).length)

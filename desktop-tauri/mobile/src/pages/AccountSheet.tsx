@@ -1,10 +1,18 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Sheet, SheetContent, SheetHeader, SheetBody, SheetFooter, SheetTitle } from '@ui'
 import { Icon } from '../components/Icon'
 import { ProviderLogo } from '../components/ProviderLogo'
 import { Badge } from '../components/ui'
 import { store } from '../state/store'
-import { deleteAccount, refreshAccount, setAccountEnabled, type Account } from '../api/gateway'
+import {
+  deleteAccount,
+  getPinnedUpstream,
+  refreshAccount,
+  setAccountEnabled,
+  setAccountPinnedUpstreamIp,
+  type Account,
+  type PinnedUpstreamSettings,
+} from '../api/gateway'
 import { accountName, formatExpiry, formatRelative, formatStamp } from '../lib/format'
 import { expiryOf, hasExpiry } from '../lib/providerFacts'
 import { providerLabel } from '../lib/providers'
@@ -16,6 +24,11 @@ import { t } from '../i18n'
  * 手机上不做「编辑表单」：账号的凭证、代理、限流规则都是多字段表单，窄屏填
  * 起来痛苦且容易出错。这一层只给**查看 + 三个高频动作**（启停、刷新凭证、
  * 删除），编辑仍回桌面端。
+ *
+ * 唯一的例外是「上游 IP」这一个下拉（WorkBuddy 国际版、且组里开了固定
+ * 上游 IP 时）：它是一个选项而不是自由文本，误操作代价低、恢复也只需再选
+ * 一次「跟随组」；而它恰恰是**换网络环境时最可能想改**的一项。多字段表单
+ * 的那条判断在这里不成立。
  */
 export function AccountSheet({
   account,
@@ -27,7 +40,29 @@ export function AccountSheet({
   onChanged: () => void
 }) {
   const [busy, setBusy] = useState('')
+  // 固定上游 IP（只有 WorkBuddy 国际版 + 组里开着时才有内容）
+  const [pin, setPin] = useState<PinnedUpstreamSettings | null>(null)
   const open = Boolean(account)
+
+  useEffect(() => {
+    if (!account || account.provider !== PINNED_PROVIDER) {
+      setPin(null)
+      return
+    }
+    let cancelled = false
+    void (async () => {
+      try {
+        const payload = await getPinnedUpstream()
+        if (!cancelled) setPin(payload.pinnedUpstreamIp)
+      } catch {
+        // 读不到就整行不显示：一个只能看不能改的下拉没有价值
+        if (!cancelled) setPin(null)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [account?.id, account?.provider])
 
   const run = async (kind: string, task: () => Promise<unknown>, success: string) => {
     setBusy(kind)
@@ -49,6 +84,21 @@ export function AccountSheet({
     if (!window.confirm(t('确定删除账号「{name}」？这个操作不可恢复。', { name }))) return
     await run('delete', () => deleteAccount(account.id), t('已删除账号'))
     onClose()
+  }
+
+  /** 改这个账号的上游 IP；`__follow__` = 回到跟随组（后端收 null）。 */
+  const pickPin = async (value: string): Promise<void> => {
+    if (!account || busy) return
+    setBusy('pin')
+    try {
+      await setAccountPinnedUpstreamIp(account.id, value === '__follow__' ? null : value)
+      // 刷新账号列表：抽屉里的下拉按**新**的账号字段重算选中项
+      onChanged()
+    } catch (error) {
+      store.toast(error instanceof Error ? error.message : String(error), 'err')
+    } finally {
+      setBusy('')
+    }
   }
 
   const limits = account?.rateLimits ? Object.entries(account.rateLimits) : []
@@ -119,6 +169,38 @@ export function AccountSheet({
                   <span className='m-k'>{t('启用')}</span>
                   <span className='m-v'>{account.enabled ? t('是') : t('否')}</span>
                 </div>
+                {pin?.enabled && pin.ips.length ? (
+                  <div className='m-row'>
+                    <span className='m-k'>{t('上游 IP')}</span>
+                    <select
+                      value={pinnedValue(account, pin)}
+                      aria-label={t('该账号固定使用的上游 IP；默认跟随组')}
+                      disabled={busy === 'pin'}
+                      onChange={event => void pickPin(String(event.target.value))}
+                      style={{
+                        height: 34,
+                        padding: '0 8px',
+                        borderRadius: 9,
+                        border: '1px solid var(--m-line)',
+                        background: 'var(--m-surface-2)',
+                        color: 'var(--m-text)',
+                        // 16px：iOS 聚焦阈值（见设置页那个语言下拉的同一处说明）
+                        fontSize: 16,
+                        maxWidth: 180,
+                        flex: 'none',
+                      }}
+                    >
+                      <option value='__follow__'>
+                        {pin.currentIp ? t('跟随组（{ip}）', { ip: pin.currentIp }) : t('跟随组')}
+                      </option>
+                      {pinOptions(account, pin).map(ip => (
+                        <option key={ip} value={ip}>
+                          {ip}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                ) : null}
                 {account.needsRelogin ? (
                   <div className='m-row'>
                     <span className='m-k'>{t('需要重新登录')}</span>
@@ -189,6 +271,29 @@ export function AccountSheet({
       </SheetContent>
     </Sheet>
   )
+}
+
+/** 固定上游 IP 只作用于这一家（与账号页同一个常量，见 ADR-0001） */
+const PINNED_PROVIDER = 'workbuddy-intl'
+
+/** 下拉的当前值：账号自己那条 IP，没有就是「跟随组」 */
+function pinnedValue(account: Account, pin: PinnedUpstreamSettings): string {
+  const pinned = String(account.pinnedUpstreamIp || '').trim()
+  return pinned || '__follow__'
+}
+
+/**
+ * 下拉的可选项：组列表 + **该账号自己那条**（如果它不在列表里）。
+ *
+ * 悬空值必须留在选项里：用户改过列表之后、后端重置之前留下的旧值，若不在
+ * 选项里，浏览器会把这个 `<select>` 渲染成空白 —— 用户看到的是「没选」，
+ * 而实际账号正钉着一条列表外的地址。
+ */
+function pinOptions(account: Account, pin: PinnedUpstreamSettings): string[] {
+  const pinned = String(account.pinnedUpstreamIp || '').trim()
+  const options = [...pin.ips]
+  if (pinned && !options.includes(pinned)) options.push(pinned)
+  return options
 }
 
 function statusTone(account: Account): 'ok' | 'warn' | 'bad' | 'mute' {

@@ -578,3 +578,71 @@ button { font: inherit; color: inherit; }
   background: var(--m-surface-3);
   white-space: nowrap;
 }
+
+/* ═══════════ 固定上游 IP（账号页组头 + 设置抽屉） ═══════════ */
+
+/* 组头右侧的读数：当前 IP + 手动切换。配色用主色系 —— 它是一枚「正在生效」
+   的状态，不是告警；告警色留给限流 / 需重登那些。 */
+.m-pin {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  padding: 1px 1px 1px 8px;
+  border-radius: 999px;
+  background: var(--m-primary-soft);
+  border: 1px solid var(--m-primary-line);
+}
+.m-pin-ip {
+  font-family: var(--m-mono);
+  font-size: 11.5px;
+  color: var(--m-primary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.m-pin-rotate,
+.m-pin-gear {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  background: none;
+  border-radius: 999px;
+  flex: none;
+}
+.m-pin-rotate {
+  width: 24px;
+  height: 24px;
+  color: var(--m-primary);
+}
+.m-pin-rotate:disabled { opacity: 0.45; }
+.m-pin-rotate svg,
+.m-pin-gear svg { width: 14px; height: 14px; }
+.m-pin-gear {
+  width: 28px;
+  height: 28px;
+  color: var(--m-text-3);
+}
+.m-pin-rotate:active,
+.m-pin-gear:active { background: var(--m-surface-2); }
+
+/* 抽屉里的表单块：标签行 + 控件 + 一行说明。刻意不抽成组件 —— 手机端只有
+   这一处表单，抽象出来反而要多读一个文件。 */
+.m-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.m-field-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.m-field-label { font-size: 13px; font-weight: 600; }
+.m-field-hint { font-size: 11.5px; color: var(--m-text-3); }
+.m-field-note {
+  font-size: 11.5px;
+  color: var(--m-text-3);
+  line-height: 1.5;
+}
